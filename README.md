@@ -2,9 +2,11 @@
 
 A Tampermonkey userscript for **app.sospos.com.au** that sends SMS to customers straight from a ticket — pulling the customer's name, phone, and device off the page, filling a template, and delivering it through your own [SMS Bridge](https://github.com/THVjQ/SMS-Brigde) server and the **SOS Messenger** Android app on a real phone.
 
-- **Version:** 17.0
+- **Version:** 17.1
 - **Runs on:** `https://app.sospos.com.au/*`
 - **Requires:** [Tampermonkey](https://www.tampermonkey.net/) with `GM_setValue` / `GM_getValue` / `GM_xmlhttpRequest` permissions, plus a running [SMS Bridge](https://github.com/THVjQ/SMS-Brigde) server and the SOS Messenger Android app
+
+> **No Chrome extension needed.** This script includes its own device pairing (🔗), so the separate `sms-extension` browser extension is optional — everything (send, configure, pair) works from this one userscript.
 
 > **This is a rewrite.** The previous version sent SMS by automating Google Messages Web (`messages.google.com`) — clicking through its UI via Shadow DOM. That's gone. This version POSTs straight to your SMS Bridge server, which hands the message to the SOS Messenger app on a paired phone. No Google Messages tab required.
 
@@ -39,6 +41,8 @@ The script ships with the server URL pre-filled but **no API key** — you must 
 
 > The server URL isn't secret — it's gated by the API key, not by obscurity — which is why it's safe to ship pre-filled. The API key is secret; never commit a real one into this repo.
 
+If you haven't paired an Android phone to the server yet, click 💬 → **🔗 Pair Device** → **Generate Pairing Code**, then on the phone: SOS Messenger app → Settings → Unlink & Re-pair → enter the server URL and the code shown.
+
 ---
 
 ## The interface
@@ -50,6 +54,11 @@ The script ships with the server URL pre-filled but **no API key** — you must 
 - **Template** — pick a built-in message template; switching templates re-fills the message body.
 - **Message** — free-form text with a live character counter (SMS segment count shown once over 160 characters).
 - **📤 Send via SOS Messenger** — sends the message through the bridge.
+
+### 🔗 Pair Device
+Generate a 15-minute pairing code to link a new Android phone to the server, and view/refresh the list of already-linked devices. Same pairing flow the Chrome extension offers, built into the script.
+
+> **One phone per server.** If you pair a second phone to the same server, outbound messages aren't routed per-desktop — they all go to whichever phone was most recently active. If you need different desktops to reliably reach different phones, run a separate SMS Bridge server instance per phone (each with its own URL/API key) rather than pairing two phones to one server.
 
 ### ⚙️ Bridge Settings
 Server URL and API key, with **Test** (pings `/health`) and **Reset to built-in defaults**.
@@ -109,6 +118,7 @@ The script runs entirely in your browser. It stores only your bridge server URL,
 
 ## Changelog
 
+- **17.1** — Added 🔗 Pair Device panel (generate pairing codes, list linked devices) so the script no longer needs the companion Chrome extension for anything.
 - **17.0** — Full rewrite: replaced Google Messages Web browser automation with a direct API call to the self-hosted SMS Bridge server. Added ⚙️ Bridge Settings panel (server URL + API key, with Test/Reset). Added `@updateURL`/`@downloadURL` for auto-updates.
 - **16.4** — Last version of the Google Messages Web automation approach (deprecated).
 

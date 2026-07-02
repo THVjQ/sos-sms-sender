@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS SMS Sender
 // @namespace    https://sosphonerepairs.com.au
-// @version      17.0
+// @version      17.1
 // @description  Send SMS to customers via SOS Messenger (SMS Bridge)
 // @author       SOS Phone Repairs
 // @match        https://app.sospos.com.au/*
@@ -60,6 +60,57 @@
       stepEl.textContent = '✅ Message queued for delivery!';
       setTimeout(() => { progressEl && progressEl.remove(); progressEl = null; }, 1800);
     }
+  }
+
+  // ── Generic authenticated API call (used by send + pairing) ─────────────────
+
+  function apiRequest(server, apikey, path, method, body) {
+    return new Promise((resolve, reject) => {
+      try {
+        GM_xmlhttpRequest({
+          method,
+          url: `${server}${path}`,
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key':    apikey,
+            'ngrok-skip-browser-warning': '1',
+          },
+          data:    body ? JSON.stringify(body) : undefined,
+          timeout: 15000,
+          onload: (res) => {
+            if (res.status === 401 || res.status === 403) {
+              reject(new Error('Authentication failed — check your API key.')); return;
+            }
+            try { resolve(JSON.parse(res.responseText)); }
+            catch (_) { reject(new Error(`Server returned invalid JSON (HTTP ${res.status})`)); }
+          },
+          onerror:   () => reject(new Error('Network error — is the SOS Messenger server running?')),
+          ontimeout: () => reject(new Error('Request timed out — check the server URL and your internet connection.')),
+        });
+      } catch (e) { reject(e); }
+    });
+  }
+
+  function bridgeCreds() {
+    return {
+      server: get('bridge_server', DEFAULT_SERVER).replace(/\/$/, ''),
+      apikey: get('bridge_apikey', DEFAULT_APIKEY),
+    };
+  }
+
+  async function generatePairingCode() {
+    const { server, apikey } = bridgeCreds();
+    if (!server || !apikey) throw new Error('Set the server URL and API key in ⚙️ Bridge Settings first.');
+    const data = await apiRequest(server, apikey, '/api/tools/sms-bridge/generate-code', 'POST');
+    if (!data.ok) throw new Error(data.error || 'Could not generate pairing code');
+    return data.code;
+  }
+
+  async function fetchPairedDevices() {
+    const { server, apikey } = bridgeCreds();
+    if (!server || !apikey) throw new Error('Set the server URL and API key in ⚙️ Bridge Settings first.');
+    const data = await apiRequest(server, apikey, '/api/tools/sms-bridge/devices', 'GET');
+    return data.devices || [];
   }
 
   // ── SOS Messenger bridge send ───────────────────────────────────────────────
@@ -286,7 +337,7 @@
     panel.innerHTML =
       '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid #1f2937;position:sticky;top:0;background:#111827;z-index:2">'
         + '<span style="font-weight:800;font-size:14px;color:#60a5fa">💬 Send SMS</span>'
-        + '<div style="display:flex;gap:3px"><button id="sms-cfg-btn" title="Bridge settings" style="' + IB + '">⚙️</button><button id="sms-tpl-btn" title="Edit templates" style="' + IB + '">✏️</button><button id="sms-close" style="' + IB + '">✕</button></div>'
+        + '<div style="display:flex;gap:3px"><button id="sms-pair-btn" title="Pair device" style="' + IB + '">🔗</button><button id="sms-cfg-btn" title="Bridge settings" style="' + IB + '">⚙️</button><button id="sms-tpl-btn" title="Edit templates" style="' + IB + '">✏️</button><button id="sms-close" style="' + IB + '">✕</button></div>'
       + '</div>'
       + '<div style="padding:11px 14px;border-bottom:1px solid #1f2937">'
         + '<label style="' + L + '">Ticket #</label>'
@@ -329,6 +380,7 @@
     document.getElementById('sms-close').onclick    = () => { panel.remove(); panel = null; };
     document.getElementById('sms-tpl-btn').onclick  = buildEditPanel;
     document.getElementById('sms-cfg-btn').onclick  = buildSettingsPanel;
+    document.getElementById('sms-pair-btn').onclick = buildPairPanel;
 
     document.getElementById('sms-read').onclick = () => {
       const f = readFromPage();
@@ -470,6 +522,77 @@
   function cfgStatus(msg, color) {
     const el = document.getElementById('cfg-status');
     if (el) { el.textContent = msg; el.style.color = color; }
+  }
+
+  // ── Pair device panel ───────────────────────────────────────────────────────
+
+  function buildPairPanel() {
+    if (panel) panel.remove();
+    panel = document.createElement('div');
+    panel.id = 'sos-sms-panel';
+    panel.style.cssText = 'position:fixed;bottom:70px;left:16px;z-index:99996;width:318px;background:#111827;border:1.5px solid #1769aa;border-radius:14px;color:#e5e7eb;font-family:system-ui,-apple-system,sans-serif;font-size:13px;box-shadow:0 10px 40px rgba(0,0,0,.6);max-height:88vh;overflow-y:auto;';
+    const { server } = bridgeCreds();
+    panel.innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid #1f2937;position:sticky;top:0;background:#111827;z-index:2">'
+        + '<span style="font-weight:800;font-size:14px;color:#60a5fa">🔗 Pair Device</span>'
+        + '<button id="pair-back" style="background:none;border:none;color:#60a5fa;font-size:12px;font-weight:700;cursor:pointer">← Back</button>'
+      + '</div>'
+      + '<div style="padding:14px">'
+        + '<div style="font-size:10.5px;color:#6b7280;margin-bottom:10px;line-height:1.5">Generate a pairing code to link a new Android device. Each code expires in 15 minutes.</div>'
+        + '<div style="font-size:10.5px;color:#888;background:#1f2937;padding:6px 10px;border-radius:6px;margin-bottom:12px;word-break:break-all">🌐 Server: ' + esc(server || 'not set') + '</div>'
+        + '<button id="pair-gen" style="width:100%;padding:10px;background:#1769aa;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer">Generate Pairing Code</button>'
+        + '<div id="pair-code-wrap" style="display:none">'
+          + '<div id="pair-code" style="font-family:monospace;font-size:22px;font-weight:800;text-align:center;letter-spacing:4px;color:#60a5fa;padding:10px;background:#0d1a2b;border-radius:8px;margin:12px 0">--------</div>'
+          + '<p style="font-size:11px;color:#9ca3af;margin:4px 0;text-align:center">1. Open SOS Messenger on Android</p>'
+          + '<p style="font-size:11px;color:#9ca3af;margin:4px 0;text-align:center">2. Go to Settings → Unlink &amp; Re-pair</p>'
+          + '<p style="font-size:11px;color:#9ca3af;margin:4px 0;text-align:center">3. Enter the server URL and code above</p>'
+        + '</div>'
+        + '<div id="pair-status" style="font-size:11.5px;min-height:16px;text-align:center;margin-top:8px"></div>'
+        + '<div style="margin-top:16px;padding-top:12px;border-top:1px solid #1f2937">'
+          + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+            + '<span style="font-size:10px;font-weight:800;color:#4b5563;text-transform:uppercase;letter-spacing:.08em">Linked devices</span>'
+            + '<button id="pair-refresh" style="background:none;border:none;color:#60a5fa;font-size:11px;cursor:pointer">↻ Refresh</button>'
+          + '</div>'
+          + '<div id="pair-devices" style="font-size:11.5px;color:#9ca3af">Click ↻ to load</div>'
+        + '</div>'
+      + '</div>';
+
+    document.body.appendChild(panel);
+    document.getElementById('pair-back').onclick = buildPanel;
+
+    document.getElementById('pair-gen').onclick = async () => {
+      const btn = document.getElementById('pair-gen');
+      const st  = document.getElementById('pair-status');
+      btn.disabled = true; btn.textContent = 'Generating…';
+      st.textContent = ''; st.style.color = '';
+      try {
+        const code = await generatePairingCode();
+        document.getElementById('pair-code').textContent = code;
+        document.getElementById('pair-code-wrap').style.display = 'block';
+      } catch (e) {
+        st.textContent = '❌ ' + (e.message || 'Could not generate code');
+        st.style.color = '#fca5a5';
+      } finally {
+        btn.disabled = false; btn.textContent = 'Generate Pairing Code';
+      }
+    };
+
+    document.getElementById('pair-refresh').onclick = async () => {
+      const list = document.getElementById('pair-devices');
+      list.textContent = 'Loading…';
+      try {
+        const devices = await fetchPairedDevices();
+        if (!devices.length) { list.textContent = 'No devices linked yet'; return; }
+        list.innerHTML = devices.map(d =>
+          '<div style="padding:6px 0;border-bottom:1px solid #1f2937">'
+            + '<div style="color:#d1d5db;font-weight:600">' + esc(d.label || 'Phone') + '</div>'
+            + '<div style="color:#6b7280;font-size:10.5px">' + esc((d.device_id || '').substring(0, 8)) + '… · last seen ' + esc(d.last_seen || '—') + '</div>'
+          + '</div>'
+        ).join('');
+      } catch (e) {
+        list.textContent = '❌ ' + (e.message || 'Could not load devices');
+      }
+    };
   }
 
   // ── Template editor ─────────────────────────────────────────────────────────
