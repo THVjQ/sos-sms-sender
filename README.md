@@ -1,37 +1,44 @@
 # SOS SMS Sender
 
-**Version:** 16.4 · **Sites:** app.sospos.com.au · messages.google.com
+**Version:** 17.0 · **Site:** app.sospos.com.au
 
-> **Note:** This script sends SMS via **Google Messages Web** (browser automation). For the full encrypted SMS bridge that routes through an Android app without needing Google Messages open, see [SMS-Bridge](https://github.com/THVjQ/SMS-Brigde).
+Send SMS messages to customers directly from SOS POS, routed through your own [SMS Bridge](https://github.com/THVjQ/SMS-Brigde) server and the **SOS Messenger** Android app on a real phone. No third-party SMS gateway, no browser automation of Google Messages — just a direct API call to your bridge server.
 
-Send SMS messages to customers directly from SOS POS, routed through Google Messages Web. No third-party SMS gateway — it uses your existing Google Messages account.
+> **Note:** This is a rewrite of the original script, which sent SMS by automating Google Messages Web (`messages.google.com`). That approach is deprecated — it required Google Messages to stay open in a tab at all times and broke whenever Google changed their UI. This version talks straight to the SMS Bridge server instead.
 
 ---
 
 ## How It Works
 
-- On **SOS POS**: Adds an SMS button to ticket/customer views. Pre-fills the customer's number and a message template, then passes the details to Google Messages Web via Tampermonkey shared storage.
-- On **Google Messages** (`messages.google.com`): Reads the queued message, auto-fills the recipient and body, and sends after a short delay.
+- Adds a **💬 Send SMS** floating button to `app.sospos.com.au`.
+- Type a ticket number (e.g. `A1234`) and it looks up the customer's name, phone, and device from the page — or falls back to a network lookup.
+- Pick a message template (or write your own), then **Send** — the script POSTs the message straight to your SMS Bridge server, which forwards it to the SOS Messenger Android app to send as a real SMS.
+- No Google Messages tab, no phone-pairing browser session required — just the server and the Android app running.
 
 ---
 
 ## Install
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/) in Chrome
-2. Click **Raw** on the `.user.js` file in this repo
-3. Tampermonkey will prompt to install — click **Install**
-4. Open **Google Messages Web** (`messages.google.com`) and pair it with your Android phone
-5. Keep Google Messages Web open in a Chrome tab while using SOS POS
+1. Install [Tampermonkey](https://www.tampermonkey.net/) in Chrome.
+2. Click **Raw** on `sos-sms-sender.user.js` in this repo — Tampermonkey will prompt to install.
+3. Open `app.sospos.com.au`, click the 💬 button, then **⚙️ Bridge Settings**.
+4. The server URL is pre-filled. Enter your **API key** (matching `API_KEY` in the server's `.env`/compose file), then **Save** and **Test**.
 
-> Google Messages Web must be open and paired with your phone for messages to send.
+> The server URL is public knowledge (it's gated by the API key, not by secrecy), so it ships pre-filled. The API key does **not** — you must set your own via the ⚙️ Settings panel. Never commit a real key into this repo; it's public.
 
 ---
 
-## Limitations
+## Requirements
 
-- Google Messages Web must be open in a tab at all times — if the tab is closed, messages will not send
-- The script automates Google Messages via Shadow DOM — it may need updates if Google changes the UI
-- For a fully self-hosted alternative that does not require Google Messages Web, see the [SMS-Bridge](https://github.com/THVjQ/SMS-Brigde) project
+- A running [SMS Bridge](https://github.com/THVjQ/SMS-Brigde) server, reachable from your browser
+- The **SOS Messenger** Android app installed, paired, and set as the default SMS app on a phone with a SIM
+- Chrome or Chromium with Tampermonkey
+
+---
+
+## Message Templates
+
+Built-in templates (Ready for Pickup, Parts Ordered, Quote Ready, Repair Delayed, Custom) support `{name}`, `{device}`, and `{ticket}` placeholders. Edit them anytime via the ✏️ button in the SMS panel — changes are saved locally per-browser via Tampermonkey storage.
 
 ---
 
