@@ -1,3 +1,4 @@
+// SOS
 // ==UserScript==
 // @name         SOS SMS Sender
 // @namespace    https://sosphonerepairs.com.au
