@@ -2,13 +2,14 @@
 // ==UserScript==
 // @name         SOS SMS Sender
 // @namespace    https://sosphonerepairs.com.au
-// @version      17.1
-// @description  Send SMS to customers via SOS Messenger (SMS Bridge)
+// @version      18.0
+// @description  Send SMS to customers via SOS Messenger (SMS Bridge) — with Sent history
 // @author       SOS Phone Repairs
 // @match        https://app.sospos.com.au/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
+// @grant        GM_setClipboard
 // @connect      *
 // @run-at       document-idle
 // @updateURL    https://raw.githubusercontent.com/THVjQ/sos-sms-sender/main/sos-sms-sender.user.js
@@ -177,6 +178,8 @@
   initSOSPOS();
 
   let panel = null;
+  let _prefill = null;   // { name, phone, ticket, device, message } consumed once by buildPanel (Resend)
+  let _lockBody = false;  // when set, syncPreview leaves the message box untouched (Resend keeps exact text)
 
   function addFAB() {
     if (!document.body) return;
@@ -324,6 +327,41 @@
   const getTemplates  = () => get('templates', DEFAULT_TEMPLATES);
   const saveTemplates = t  => set('templates', t);
 
+  // ── Sent history ─────────────────────────────────────────────────────────────
+
+  const HISTORY_CAP    = 300;                         // keep the most recent N sends
+  const getHistory     = () => get('sms_history', []);
+  const saveHistory    = h  => set('sms_history', h);
+
+  // Records a successful send. Newest first, capped at HISTORY_CAP.
+  function recordSent(entry) {
+    try {
+      const h = getHistory();
+      h.unshift({
+        ts:      Date.now(),
+        phone:   entry.phone   || '',
+        name:    entry.name    || '',
+        ticket:  entry.ticket  || '',
+        device:  entry.device  || '',
+        message: entry.message || '',
+      });
+      if (h.length > HISTORY_CAP) h.length = HISTORY_CAP;
+      saveHistory(h);
+    } catch (_) {}
+  }
+
+  function relTime(ts) {
+    const s = Math.floor((Date.now() - ts) / 1000);
+    if (s < 60)     return 'just now';
+    if (s < 3600)   return Math.floor(s / 60)   + 'm ago';
+    if (s < 86400)  return Math.floor(s / 3600) + 'h ago';
+    if (s < 604800) return Math.floor(s / 86400) + 'd ago';
+    return new Date(ts).toLocaleDateString();
+  }
+  function absTime(ts) {
+    try { return new Date(ts).toLocaleString(); } catch (_) { return ''; }
+  }
+
   // ── Panel builder ───────────────────────────────────────────────────────────
 
   function buildPanel() {
@@ -331,14 +369,16 @@
     const templates   = getTemplates();
     const savedTplId  = get('lastTplId', templates[0] && templates[0].id || 't1');
     const tpl         = templates.find(t => t.id === savedTplId) || templates[0];
-    const d           = readFromPage();
+    const pf          = _prefill || {}; _prefill = null;
+    const d           = Object.assign(readFromPage(), pf);
+    _lockBody = false;
     panel = document.createElement('div');
     panel.id = 'sos-sms-panel';
     panel.style.cssText = 'position:fixed;bottom:70px;left:16px;z-index:99996;width:318px;background:#111827;border:1.5px solid #1769aa;border-radius:14px;color:#e5e7eb;font-family:system-ui,-apple-system,sans-serif;font-size:13px;box-shadow:0 10px 40px rgba(0,0,0,.6);max-height:88vh;overflow-y:auto;';
     panel.innerHTML =
       '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid #1f2937;position:sticky;top:0;background:#111827;z-index:2">'
         + '<span style="font-weight:800;font-size:14px;color:#60a5fa">💬 Send SMS</span>'
-        + '<div style="display:flex;gap:3px"><button id="sms-pair-btn" title="Pair device" style="' + IB + '">🔗</button><button id="sms-cfg-btn" title="Bridge settings" style="' + IB + '">⚙️</button><button id="sms-tpl-btn" title="Edit templates" style="' + IB + '">✏️</button><button id="sms-close" style="' + IB + '">✕</button></div>'
+        + '<div style="display:flex;gap:3px"><button id="sms-hist-btn" title="Sent history" style="' + IB + '">📜</button><button id="sms-pair-btn" title="Pair device" style="' + IB + '">🔗</button><button id="sms-cfg-btn" title="Bridge settings" style="' + IB + '">⚙️</button><button id="sms-tpl-btn" title="Edit templates" style="' + IB + '">✏️</button><button id="sms-close" style="' + IB + '">✕</button></div>'
       + '</div>'
       + '<div style="padding:11px 14px;border-bottom:1px solid #1f2937">'
         + '<label style="' + L + '">Ticket #</label>'
@@ -375,6 +415,11 @@
     document.body.appendChild(panel);
     wirePanelEvents();
     if (d.ticket) onTicketInput(d.ticket);
+    // Resend: pin the exact original text so template/lookup auto-fill can't clobber it.
+    if (pf.message != null) {
+      const b = document.getElementById('sms-body');
+      if (b) { b.value = pf.message; _lockBody = true; countChars(); }
+    }
   }
 
   function wirePanelEvents() {
@@ -382,6 +427,7 @@
     document.getElementById('sms-tpl-btn').onclick  = buildEditPanel;
     document.getElementById('sms-cfg-btn').onclick  = buildSettingsPanel;
     document.getElementById('sms-pair-btn').onclick = buildPairPanel;
+    document.getElementById('sms-hist-btn').onclick = buildHistoryPanel;
 
     document.getElementById('sms-read').onclick = () => {
       const f = readFromPage();
@@ -406,6 +452,7 @@
 
     panel.querySelectorAll('input[name="sms-tpl"]').forEach(r => {
       r.onchange = () => {
+        _lockBody = false;   // explicit template choice overrides a pinned Resend message
         set('lastTplId', r.value);
         const t = getTemplates().find(t => t.id === r.value);
         if (t) document.getElementById('sms-body').value = applyVars(t.body, curVals());
@@ -426,8 +473,11 @@
       if (!message)  { flash('⚠️ Message cannot be empty');  return; }
       panel.remove(); panel = null;
       showProgress('Connecting to SOS Messenger…', 10);
+      const normPhone = normalizePhone(v.phone);
       try {
-        await sendViaBridge(normalizePhone(v.phone), message);
+        await sendViaBridge(normPhone, message);
+        // Only reached when the send resolved (sendViaBridge throws on failure).
+        recordSent({ phone: normPhone, name: v.name, ticket: v.ticket, device: v.device, message });
       } catch (e) {
         console.error('[SOS SMS]', e);
         showProgress('', 0, e.message || 'Unknown error');
@@ -596,6 +646,101 @@
     };
   }
 
+  // ── Sent history panel ──────────────────────────────────────────────────────
+
+  function buildHistoryPanel() {
+    if (panel) panel.remove();
+    panel = document.createElement('div');
+    panel.id = 'sos-sms-panel';
+    panel.style.cssText = 'position:fixed;bottom:70px;left:16px;z-index:99996;width:318px;background:#111827;border:1.5px solid #1769aa;border-radius:14px;color:#e5e7eb;font-family:system-ui,-apple-system,sans-serif;font-size:13px;box-shadow:0 10px 40px rgba(0,0,0,.6);max-height:88vh;overflow-y:auto;';
+    panel.innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid #1f2937;position:sticky;top:0;background:#111827;z-index:2">'
+        + '<span style="font-weight:800;font-size:14px;color:#60a5fa">📜 Sent History</span>'
+        + '<button id="hist-back" style="background:none;border:none;color:#60a5fa;font-size:12px;font-weight:700;cursor:pointer">← Back</button>'
+      + '</div>'
+      + '<div style="padding:9px 14px;border-bottom:1px solid #1f2937;display:flex;gap:6px;align-items:center">'
+        + '<input id="hist-search" placeholder="🔍 Search name, phone, ticket, text…" style="' + I + ';flex:1">'
+      + '</div>'
+      + '<div id="hist-list" style="padding:8px 14px 4px"></div>'
+      + '<div style="padding:2px 14px 14px">'
+        + '<button id="hist-export" style="width:100%;padding:8px;background:#1f2937;color:#60a5fa;border:1px solid #374151;border-radius:8px;font-size:12px;font-weight:700;cursor:pointer">⬇ Export</button>'
+      + '</div>';
+    document.body.appendChild(panel);
+
+    document.getElementById('hist-back').onclick = buildPanel;
+    document.getElementById('hist-search').oninput = e => renderHistoryList(e.target.value.trim().toLowerCase());
+
+    document.getElementById('hist-export').onclick = () => {
+      const h = getHistory();
+      if (!h.length) { flash('⚠️ Nothing to export'); return; }
+      const lines = h.map(e =>
+        [absTime(e.ts), e.ticket, e.name, e.phone, JSON.stringify(e.message || '')].join('\t')
+      );
+      const blob = 'Sent At\tTicket\tName\tPhone\tMessage\n' + lines.join('\n');
+      try {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([blob], { type: 'text/tab-separated-values' }));
+        a.download = 'sos-sms-history-' + new Date().toISOString().slice(0, 10) + '.tsv';
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+      } catch (_) {}
+    };
+
+    renderHistoryList('');
+  }
+
+  function renderHistoryList(query) {
+    const wrap = document.getElementById('hist-list');
+    if (!wrap) return;
+    const all = getHistory();
+
+    if (!all.length) {
+      wrap.innerHTML = '<div style="text-align:center;color:#4b5563;font-size:12px;padding:26px 0;line-height:1.6">No messages sent yet.<br><span style="font-size:11px">Sends will appear here automatically.</span></div>';
+      return;
+    }
+
+    const items = query
+      ? all.filter(e => (e.name + ' ' + e.phone + ' ' + e.ticket + ' ' + e.device + ' ' + e.message).toLowerCase().includes(query))
+      : all;
+
+    if (!items.length) {
+      wrap.innerHTML = '<div style="text-align:center;color:#4b5563;font-size:12px;padding:26px 0">No matches for that search.</div>';
+      return;
+    }
+
+    wrap.innerHTML = items.map((e, i) => {
+      const who   = esc(e.name || e.phone || 'Unknown');
+      const meta  = [e.ticket && ('#' + e.ticket), e.phone, e.device].filter(Boolean).map(esc).join(' · ');
+      const idx   = all.indexOf(e);   // stable index into the full list for actions
+      return '<div class="hist-card" style="background:#1f2937;border:1px solid #374151;border-radius:9px;padding:9px 11px;margin-bottom:8px">'
+        + '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:3px">'
+          + '<span style="font-weight:700;color:#93c5fd;font-size:12.5px">' + who + '</span>'
+          + '<span title="' + esc(absTime(e.ts)) + '" style="font-size:10px;color:#6b7280;white-space:nowrap;flex-shrink:0">' + esc(relTime(e.ts)) + '</span>'
+        + '</div>'
+        + (meta ? '<div style="font-size:10.5px;color:#6b7280;margin-bottom:5px">' + meta + '</div>' : '')
+        + '<div style="font-size:12px;color:#d1d5db;white-space:pre-wrap;line-height:1.45;background:#111827;border-radius:6px;padding:7px 9px;max-height:110px;overflow-y:auto">' + esc(e.message || '') + '</div>'
+        + '<div style="display:flex;gap:6px;margin-top:7px">'
+          + '<button class="hist-resend" data-idx="' + idx + '" style="flex:1;padding:5px;background:#111827;color:#60a5fa;border:1px solid #374151;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer">↻ Resend</button>'
+          + '<button class="hist-copy"   data-idx="' + idx + '" style="flex:1;padding:5px;background:#111827;color:#9ca3af;border:1px solid #374151;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer">⧉ Copy</button>'
+        + '</div>'
+      + '</div>';
+    }).join('');
+
+    wrap.querySelectorAll('.hist-resend').forEach(b => b.onclick = () => {
+      const e = getHistory()[+b.dataset.idx]; if (!e) return;
+      _prefill = { name: e.name, phone: e.phone, ticket: e.ticket, device: e.device, message: e.message || '' };
+      buildPanel();
+    });
+
+    wrap.querySelectorAll('.hist-copy').forEach(b => b.onclick = () => {
+      const e = getHistory()[+b.dataset.idx]; if (!e) return;
+      try { GM_setClipboard(e.message || ''); } catch (_) {
+        try { navigator.clipboard.writeText(e.message || ''); } catch (__) {}
+      }
+      b.textContent = '✓ Copied'; setTimeout(() => { b.textContent = '⧉ Copy'; }, 1200);
+    });
+  }
+
   // ── Template editor ─────────────────────────────────────────────────────────
 
   function buildEditPanel() {
@@ -658,6 +803,7 @@
     };
   }
   function syncPreview() {
+    if (_lockBody) { countChars(); return; }   // Resend has pinned the message box
     const tpl = getTemplates().find(t => t.id === get('lastTplId',''));
     if (tpl) { const b = document.getElementById('sms-body'); if (b) b.value = applyVars(tpl.body, curVals()); }
     countChars();
