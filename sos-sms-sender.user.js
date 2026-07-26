@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         SOS SMS Sender
 // @namespace    https://sosphonerepairs.com.au
-// @version      19.0
-// @description  Send SMS to customers via SOS Messenger (SMS Bridge) — targeted delivery + Sent history
+// @version      20.0
+// @description  Send SMS to customers via SOS Messenger (SMS Bridge) — targeted delivery, replies, Sent history
 // @author       SOS Phone Repairs
 // @match        https://app.sospos.com.au/*
 // @grant        GM_setValue
@@ -35,6 +35,84 @@
   // ready for collection".
   const CONFIRM_TIMEOUT_MS  = 30000;
   const CONFIRM_INTERVAL_MS = 2000;
+
+  // ── End-to-end inbound: this PC's keypair ───────────────────────────────────
+  //
+  // Replies used to be encrypted to the SERVER's key and decrypted by it on the way out, so the
+  // server could read every incoming customer message while the code claimed otherwise. This PC now
+  // owns a P-256 keypair; the phone encrypts one envelope per registered desktop and the server
+  // relays ciphertext it holds no key for.
+  //
+  // ECIES v1, byte-compatible with the server (node:crypto) and NexLink (JCA):
+  //   ECDH P-256 → HKDF-SHA256, 32 zero bytes of salt, info "sms-bridge-v1" → AES-256-GCM,
+  //   12-byte IV, 16-byte tag, AAD = info. Envelope { v, epk, iv, tag, ct }, all base64.
+
+  const E2E_INFO = new TextEncoder().encode('sms-bridge-v1');
+  const E2E_SALT = new Uint8Array(32);
+
+  const b64enc = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+  const b64dec = s   => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+  async function getOrCreateClientKeys() {
+    const stored = get('client_keypair', null);
+    if (stored && stored.privateJwk && stored.publicB64) return stored;
+
+    const pair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+    const fresh = {
+      privateJwk: await crypto.subtle.exportKey('jwk', pair.privateKey),
+      publicB64:  b64enc(await crypto.subtle.exportKey('spki', pair.publicKey)),
+    };
+    set('client_keypair', fresh);
+    return fresh;
+  }
+
+  /** First 8 bytes of SHA-256 over the DER, as hex — computed identically on all three sides. */
+  async function clientKeyId(publicB64) {
+    const digest = await crypto.subtle.digest('SHA-256', b64dec(publicB64));
+    return Array.from(new Uint8Array(digest).slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  async function deriveAesKey(privateJwk, ephemeralSpkiB64) {
+    const priv = await crypto.subtle.importKey('jwk', privateJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+    const epk  = await crypto.subtle.importKey('spki', b64dec(ephemeralSpkiB64), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+    const shared = await crypto.subtle.deriveBits({ name: 'ECDH', public: epk }, priv, 256);
+
+    const hkdfKey = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits(
+      { name: 'HKDF', hash: 'SHA-256', salt: E2E_SALT, info: E2E_INFO }, hkdfKey, 256);
+    return crypto.subtle.importKey('raw', bits, { name: 'AES-GCM' }, false, ['decrypt']);
+  }
+
+  async function decryptEnvelope(envelope, privateJwk) {
+    if (!envelope || envelope.v !== 1) throw new Error('Unknown envelope version');
+    const aesKey = await deriveAesKey(privateJwk, envelope.epk);
+    // WebCrypto expects ciphertext and tag concatenated; the wire format keeps them apart.
+    const ct  = b64dec(envelope.ct);
+    const tag = b64dec(envelope.tag);
+    const buf = new Uint8Array(ct.length + tag.length);
+    buf.set(ct); buf.set(tag, ct.length);
+    const plain = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: b64dec(envelope.iv), additionalData: E2E_INFO, tagLength: 128 }, aesKey, buf);
+    return new TextDecoder().decode(plain);
+  }
+
+  /**
+   * Publishes this PC's public key so phones on the account can address replies to it. Cheap and
+   * idempotent, so it runs on startup and again whenever the inbox is opened — a reply that arrives
+   * before any PC has registered is the case the phone has to queue for.
+   */
+  async function registerClientKey() {
+    const { server, apikey } = bridgeCreds();
+    if (!server || !apikey) return null;
+    const keys = await getOrCreateClientKeys();
+    try {
+      await apiRequest(server, apikey, '/api/tools/sms-bridge/client-key', 'POST',
+        { public_key: keys.publicB64, label: get('client_label', 'This PC') });
+    } catch (e) {
+      console.warn('[SOS SMS] could not register this PC\'s key:', e.message);
+    }
+    return keys;
+  }
 
   // ── Progress overlay ────────────────────────────────────────────────────────
 
@@ -254,6 +332,9 @@
     } else {
       addFAB(); setInterval(addFAB, 2000);
     }
+    // Publish this PC's public key early: until a phone knows it, replies have nowhere to go and
+    // sit queued on the handset.
+    registerClientKey().catch(() => {});
   }
 
   initSOSPOS();
@@ -461,7 +542,7 @@
     panel.innerHTML =
       '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid #1f2937;position:sticky;top:0;background:#111827;z-index:2">'
         + '<span style="font-weight:800;font-size:14px;color:#60a5fa">💬 Send SMS</span>'
-        + '<div style="display:flex;gap:3px"><button id="sms-hist-btn" title="Sent history" style="' + IB + '">📜</button><button id="sms-pair-btn" title="Pair device" style="' + IB + '">🔗</button><button id="sms-cfg-btn" title="Bridge settings" style="' + IB + '">⚙️</button><button id="sms-tpl-btn" title="Edit templates" style="' + IB + '">✏️</button><button id="sms-close" style="' + IB + '">✕</button></div>'
+        + '<div style="display:flex;gap:3px"><button id="sms-inbox-btn" title="Replies" style="' + IB + '">📥</button><button id="sms-hist-btn" title="Sent history" style="' + IB + '">📜</button><button id="sms-pair-btn" title="Pair device" style="' + IB + '">🔗</button><button id="sms-cfg-btn" title="Bridge settings" style="' + IB + '">⚙️</button><button id="sms-tpl-btn" title="Edit templates" style="' + IB + '">✏️</button><button id="sms-close" style="' + IB + '">✕</button></div>'
       + '</div>'
       + '<div style="padding:11px 14px;border-bottom:1px solid #1f2937">'
         + '<label style="' + L + '">Ticket #</label>'
@@ -510,7 +591,8 @@
     document.getElementById('sms-tpl-btn').onclick  = buildEditPanel;
     document.getElementById('sms-cfg-btn').onclick  = buildSettingsPanel;
     document.getElementById('sms-pair-btn').onclick = buildPairPanel;
-    document.getElementById('sms-hist-btn').onclick = buildHistoryPanel;
+    document.getElementById('sms-hist-btn').onclick  = buildHistoryPanel;
+    document.getElementById('sms-inbox-btn').onclick = buildInboxPanel;
 
     document.getElementById('sms-read').onclick = () => {
       const f = readFromPage();
@@ -828,6 +910,92 @@
 
     document.getElementById('pair-refresh').onclick = refreshDevices;
     refreshDevices();
+  }
+
+  // ── Inbox panel (customer replies) ──────────────────────────────────────────
+
+  function buildInboxPanel() {
+    if (panel) panel.remove();
+    panel = document.createElement('div');
+    panel.id = 'sos-sms-panel';
+    panel.style.cssText = 'position:fixed;bottom:70px;left:16px;z-index:99996;width:318px;background:#111827;border:1.5px solid #1769aa;border-radius:14px;color:#e5e7eb;font-family:system-ui,-apple-system,sans-serif;font-size:13px;box-shadow:0 10px 40px rgba(0,0,0,.6);max-height:88vh;overflow-y:auto;';
+    panel.innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid #1f2937;position:sticky;top:0;background:#111827;z-index:2">'
+        + '<span style="font-weight:800;font-size:14px;color:#60a5fa">📥 Replies</span>'
+        + '<div style="display:flex;gap:8px;align-items:center">'
+          + '<button id="inbox-refresh" style="background:none;border:none;color:#60a5fa;font-size:11px;cursor:pointer">↻</button>'
+          + '<button id="inbox-back" style="background:none;border:none;color:#60a5fa;font-size:12px;font-weight:700;cursor:pointer">← Back</button>'
+        + '</div>'
+      + '</div>'
+      + '<div id="inbox-list" style="padding:10px 14px 14px;color:#9ca3af;font-size:12px">Loading…</div>';
+    document.body.appendChild(panel);
+
+    document.getElementById('inbox-back').onclick    = buildPanel;
+    document.getElementById('inbox-refresh').onclick = loadInbox;
+    loadInbox();
+  }
+
+  async function loadInbox() {
+    const wrap = document.getElementById('inbox-list');
+    if (!wrap) return;
+    wrap.textContent = 'Loading…';
+
+    const { server, apikey } = bridgeCreds();
+    if (!server || !apikey) { wrap.textContent = 'Set the server URL and API key in ⚙️ Bridge Settings first.'; return; }
+
+    let keys, myKeyId, rows;
+    try {
+      keys    = await registerClientKey();
+      myKeyId = await clientKeyId(keys.publicB64);
+      const data = await apiRequest(server, apikey, '/api/tools/sms-bridge/incoming', 'GET');
+      rows = data.messages || [];
+    } catch (e) {
+      wrap.innerHTML = '<div style="color:#fca5a5">❌ ' + esc(e.message || 'Could not load replies') + '</div>';
+      return;
+    }
+
+    if (!rows.length) {
+      wrap.innerHTML = '<div style="text-align:center;color:#4b5563;padding:26px 0;line-height:1.6">No replies yet.<br>'
+        + '<span style="font-size:11px">Incoming texts to the bridge phone appear here.</span></div>';
+      return;
+    }
+
+    const cards = [];
+    for (const row of rows) {
+      let text, note = '';
+      if (row.e2e) {
+        const envelope = row.envelopes && row.envelopes[myKeyId];
+        if (!envelope) {
+          // Encrypted for other desktops only — this PC registered its key after the reply arrived.
+          text = '🔒 Encrypted for another PC';
+          note = 'This reply arrived before this PC registered its key. It can only be read on a PC that was registered at the time.';
+        } else {
+          try { text = await decryptEnvelope(envelope, keys.privateJwk); }
+          catch (_) { text = '🔒 Could not decrypt'; note = 'The stored key no longer matches. Replies sent before this PC\'s key changed cannot be recovered.'; }
+        }
+      } else {
+        // Legacy row: the server decrypted this one, so it was readable in transit on the server.
+        text = row.message || '';
+        note = 'Sent by an older phone app — the server could read this one. Update the phone to close that gap.';
+      }
+
+      cards.push(
+        '<div style="background:#1f2937;border:1px solid #374151;border-radius:9px;padding:9px 11px;margin-bottom:8px">'
+          + '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:4px">'
+            + '<span style="font-weight:700;color:#93c5fd;font-size:12.5px">' + esc(row.sender || 'Unknown') + '</span>'
+            + '<span style="font-size:10px;color:#6b7280;white-space:nowrap">' + esc(row.received_at || '') + '</span>'
+          + '</div>'
+          + '<div style="font-size:12px;color:#d1d5db;white-space:pre-wrap;line-height:1.45;background:#111827;border-radius:6px;padding:7px 9px">' + esc(text) + '</div>'
+          + (note ? '<div style="font-size:10px;color:#fbbf24;margin-top:5px;line-height:1.4">⚠ ' + esc(note) + '</div>' : '')
+          + '<button class="inbox-reply" data-phone="' + esc(row.sender || '') + '" style="width:100%;margin-top:7px;padding:5px;background:#111827;color:#60a5fa;border:1px solid #374151;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer">↩ Reply</button>'
+        + '</div>');
+    }
+
+    wrap.innerHTML = cards.join('');
+    wrap.querySelectorAll('.inbox-reply').forEach(b => b.onclick = () => {
+      _prefill = { phone: b.dataset.phone, message: '' };
+      buildPanel();
+    });
   }
 
   // ── Sent history panel ──────────────────────────────────────────────────────
