@@ -2,7 +2,7 @@
 
 A Tampermonkey userscript for **app.sospos.com.au** that sends SMS to customers straight from a ticket — pulling the customer's name, phone, and device off the page, filling a template, and delivering it through your own [SMS Bridge](https://github.com/THVjQ/SMS-Brigde) server and the **SOS Messenger** Android app on a real phone.
 
-- **Version:** 17.1
+- **Version:** 21.0
 - **Runs on:** `https://app.sospos.com.au/*`
 - **Requires:** [Tampermonkey](https://www.tampermonkey.net/) with `GM_setValue` / `GM_getValue` / `GM_xmlhttpRequest` permissions, plus a running [SMS Bridge](https://github.com/THVjQ/SMS-Brigde) server and the SOS Messenger Android app
 
@@ -32,16 +32,31 @@ You should see a round blue **💬 button** in the bottom-left corner. Click it 
 
 ## First-time setup
 
-The script ships with the server URL pre-filled but **no API key** — you must set your own.
+You sign in with a username and password. There is no API key to copy — logging in issues this
+browser a credential behind the scenes.
 
 1. Click 💬 → **⚙️ Bridge Settings**.
 2. Confirm the **Server URL** (defaults to `https://sosmessenger.thvjq.com.au`).
-3. Paste your **API key** — the same value configured in the SMS Bridge server's `.env`/compose file and the SOS Messenger Android app.
-4. Click **🔍 Test** to confirm the server is reachable, then **💾 Save**.
+3. **Sign in**, or **Create an account →** if you don't have one.
+4. Click **💾 Save**.
 
-> The server URL isn't secret — it's gated by the API key, not by obscurity — which is why it's safe to ship pre-filled. The API key is secret; never commit a real one into this repo.
+New accounts start as *pending* and can't do anything until the server's administrator approves
+them — you'll see "waiting to be approved" if you try to sign in first. The very first account
+registered on a fresh server becomes the administrator automatically.
 
-If you haven't paired an Android phone to the server yet, click 💬 → **🔗 Pair Device** → **Generate Pairing Code**, then on the phone: SOS Messenger app → Settings → Unlink & Re-pair → enter the server URL and the code shown.
+> Adding another PC is just: install the script, enter the URL, sign in with the same username and
+> password. Same account, same phones, same history.
+
+An API key can still be pasted in via **Use an API key**, for a server that predates sign-in. It is
+a fallback, not the normal route.
+
+### Pairing a phone
+
+Click 💬 → **🔗 Pair Device** → **Generate Pairing Code**, then on the phone: NexLink → Computer
+Bridge → enter the server URL and the code. The phone needs no API key; pairing issues it one.
+
+Codes expire after 15 minutes and carry the account that generated them — so a phone joins whoever
+made the code. If you're setting someone else up, they generate the code on their own PC.
 
 ---
 
@@ -58,10 +73,27 @@ If you haven't paired an Android phone to the server yet, click 💬 → **🔗 
 ### 🔗 Pair Device
 Generate a 15-minute pairing code to link a new Android phone to the server, and view/refresh the list of already-linked devices. Same pairing flow the Chrome extension offers, built into the script.
 
-> **One phone per server.** If you pair a second phone to the same server, outbound messages aren't routed per-desktop — they all go to whichever phone was most recently active. If you need different desktops to reliably reach different phones, run a separate SMS Bridge server instance per phone (each with its own URL/API key) rather than pairing two phones to one server.
+Each phone is listed with its last-seen time, flagged if it has no encryption key, and can be
+retired with 🗑 — which also fails anything still queued for it.
+
+> **Several phones on one server is now supported.** Messages are routed to a named device and
+> claimed atomically, so two phones never deliver the same text. Choose which phone this PC sends
+> through under **Send through** in ⚙️ Bridge Settings; with one phone paired it binds automatically.
+
+### 📥 Replies
+Customer replies, decrypted in your browser. Each PC has its own key pair and the phone encrypts a
+copy for every registered PC, so replies reach all of them and the server can read none of them.
+**↩ Reply** opens the send panel with the number filled in.
+
+A reply that arrived before this PC registered its key will show as encrypted for another PC — it
+can only be read where it was addressed.
+
+### 👤 Administration *(admins only)*
+Approve or deny pending sign-ups, and suspend or reactivate people. The button only appears for an
+administrator, and the server refuses these routes to anyone else.
 
 ### ⚙️ Bridge Settings
-Server URL and API key, with **Test** (pings `/health`) and **Reset to built-in defaults**.
+Server URL, sign-in, and **Send through** (which phone this PC uses).
 
 ### ✏️ Edit Templates
 Add, rename, edit, or delete message templates. Supports `{name}`, `{device}`, `{ticket}` placeholders.
@@ -97,10 +129,29 @@ Edit them anytime via ✏️ — changes are saved locally per-browser via Tampe
 Confirm the script is enabled in Tampermonkey and you're on `app.sospos.com.au`. Hard-refresh the page.
 
 **"SOS Messenger not configured" error.**
-You haven't set an API key yet — click ⚙️ Bridge Settings and fill it in.
+You haven't signed in — click ⚙️ Bridge Settings and sign in.
 
-**"Authentication failed" / HTTP 401-403.**
-The API key doesn't match what's set on the server. Re-check the key in ⚙️ Settings against the server's `.env`/compose `API_KEY`.
+**"Authentication failed" / HTTP 401.**
+Your session was revoked, or the account was suspended. Sign in again from ⚙️ Bridge Settings.
+
+**"Your account is waiting to be approved."**
+Working as intended — an administrator has to approve the account before it can sign in.
+
+**"has no encryption key — re-pair it from the phone."**
+The phone is registered but the server has nothing to encrypt to. On the phone: Computer Bridge →
+Unlink & re-pair, with a fresh code. Nothing is sent in plaintext as a fallback.
+
+**"Several phones are paired and none is set as default."**
+Pick which phone this PC sends through in ⚙️ Bridge Settings.
+
+**A message stays "unconfirmed".**
+It was queued but no phone collected it within 30 seconds. Check the phone is on, has signal, and
+isn't being killed by battery optimisation. The message may still go out later — the panel says
+unconfirmed rather than claiming success.
+
+**Replies aren't reaching this PC.**
+The phone refreshes its list of PCs every 5 minutes; a newly added PC isn't known until then. Wait,
+or re-pair the phone to pick it up immediately.
 
 **"Network error" / "Could not reach server."**
 The SMS Bridge server isn't reachable from your browser — confirm it's running, and that the server URL in Settings matches (test with 🔍 Test).
@@ -112,12 +163,32 @@ The DOM/network parsers rely on the page's layout — if SOS POS changes how tic
 
 ## Privacy & data
 
-The script runs entirely in your browser. It stores only your bridge server URL, API key, and message templates locally via Tampermonkey's storage (`GM_setValue`) — nothing is sent anywhere except the message POST to your own SMS Bridge server when you click Send. See the [SMS Bridge privacy policy](https://github.com/THVjQ/SMS-Brigde/blob/main/PRIVACY_POLICY.md) for what happens to a message after it reaches the server.
+The script runs entirely in your browser. It stores your server URL, the API key issued when you
+sign in, your message templates, sent history, and **this PC's private key** locally via
+Tampermonkey's storage (`GM_setValue`). Nothing is sent anywhere except your own SMS Bridge server.
+
+Messages are sealed in your browser before they are sent, and replies are decrypted in it — the
+server relays ciphertext in both directions and holds no key that opens it. Metadata is not
+encrypted: the server sees phone numbers, timing and message sizes, because it needs them to route.
+
+The private key never leaves this browser profile. Clearing Tampermonkey's storage loses it, and
+replies encrypted to it become unreadable. See the
+[SMS Bridge privacy policy](https://github.com/THVjQ/SMS-Brigde/blob/main/PRIVACY_POLICY.md) for
+what happens on the server side.
 
 ---
 
 ## Changelog
 
+- **21.0** — Sign in with a username and password instead of pasting an API key; open signup gated
+  by admin approval. Outbound messages are now encrypted in the browser rather than by the server.
+  Added the 👤 admin panel for approvals, visible only to administrators.
+- **20.0** — Added the 📥 Replies panel: this PC generates its own key pair, registers it, and
+  decrypts replies locally. The server can no longer read inbound messages.
+- **19.0** — Added the **Send through** phone picker and real delivery confirmation — a message is
+  reported delivered, failed, or explicitly unconfirmed, never just "queued". Pair Device gained
+  device removal and flags phones missing an encryption key.
+- **18.0** — Added the 📜 Sent history panel with search, resend and export.
 - **17.1** — Added 🔗 Pair Device panel (generate pairing codes, list linked devices) so the script no longer needs the companion Chrome extension for anything.
 - **17.0** — Full rewrite: replaced Google Messages Web browser automation with a direct API call to the self-hosted SMS Bridge server. Added ⚙️ Bridge Settings panel (server URL + API key, with Test/Reset). Added `@updateURL`/`@downloadURL` for auto-updates.
 - **16.4** — Last version of the Google Messages Web automation approach (deprecated).

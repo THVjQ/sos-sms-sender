@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         SOS SMS Sender
 // @namespace    https://sosphonerepairs.com.au
-// @version      20.0
-// @description  Send SMS to customers via SOS Messenger (SMS Bridge) — targeted delivery, replies, Sent history
+// @version      21.0
+// @description  Send SMS to customers via SOS Messenger (SMS Bridge) — sign-in, end-to-end encrypted send, replies, Sent history
 // @author       SOS Phone Repairs
 // @match        https://app.sospos.com.au/*
 // @grant        GM_setValue
@@ -81,6 +81,43 @@
     const bits = await crypto.subtle.deriveBits(
       { name: 'HKDF', hash: 'SHA-256', salt: E2E_SALT, info: E2E_INFO }, hkdfKey, 256);
     return crypto.subtle.importKey('raw', bits, { name: 'AES-GCM' }, false, ['decrypt']);
+  }
+
+  /**
+   * Seals `plaintext` for the holder of `recipientSpkiB64` — used to encrypt outbound texts to the
+   * phone before they leave this browser.
+   *
+   * Until this existed the userscript posted plaintext and the SERVER encrypted it to the phone's
+   * key. Ciphertext at rest, but the server read every outgoing message on the way through, which
+   * matters the moment someone else's messages are on the same server.
+   */
+  async function encryptEnvelope(plaintext, recipientSpkiB64) {
+    const recipient = await crypto.subtle.importKey(
+      'spki', b64dec(recipientSpkiB64), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+    const ephemeral = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+
+    const shared  = await crypto.subtle.deriveBits({ name: 'ECDH', public: recipient }, ephemeral.privateKey, 256);
+    const hkdfKey = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+    const bits    = await crypto.subtle.deriveBits(
+      { name: 'HKDF', hash: 'SHA-256', salt: E2E_SALT, info: E2E_INFO }, hkdfKey, 256);
+    const aesKey  = await crypto.subtle.importKey('raw', bits, { name: 'AES-GCM' }, false, ['encrypt']);
+
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const sealed = new Uint8Array(await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv, additionalData: E2E_INFO, tagLength: 128 },
+      aesKey, new TextEncoder().encode(plaintext)));
+
+    // WebCrypto returns ciphertext||tag; the wire format keeps them as separate fields.
+    const ct  = sealed.slice(0, sealed.length - 16);
+    const tag = sealed.slice(sealed.length - 16);
+
+    return {
+      v:   1,
+      epk: b64enc(await crypto.subtle.exportKey('spki', ephemeral.publicKey)),
+      iv:  b64enc(iv),
+      tag: b64enc(tag),
+      ct:  b64enc(ct),
+    };
   }
 
   async function decryptEnvelope(envelope, privateJwk) {
@@ -204,6 +241,58 @@
   const getTargetDevice = () => get('bridge_device_id', '');
   const setTargetDevice = id => set('bridge_device_id', id || '');
 
+  // ── Sign-in ─────────────────────────────────────────────────────────────────
+  //
+  // Signing in mints an API key for this browser and stores it where the key field used to be
+  // written by hand, so everything downstream is unchanged — a person just never handles a key.
+  // The key is still what authenticates every request; the login is only how it gets here.
+
+  const getSession    = () => get('bridge_session', null);   // { username, role, account_id }
+  const setSession    = s  => set('bridge_session', s);
+  const clearSession  = () => { set('bridge_session', null); set('bridge_apikey', ''); };
+  const isAdmin       = () => { const s = getSession(); return !!s && s.role === 'admin'; };
+
+  async function authRequest(path, body) {
+    const { server } = bridgeCreds();
+    if (!server) throw new Error('Set the server URL first.');
+    const { status, data } = await bridgeCall(server, '', '/api/tools/sms-bridge' + path, 'POST', body);
+    if (!data) throw new Error(`Server returned invalid JSON (HTTP ${status})`);
+    if (status >= 400) {
+      const err = new Error(data.error || `Sign-in failed (HTTP ${status})`);
+      err.code = data.code;
+      throw err;
+    }
+    return data;
+  }
+
+  async function doLogin(username, password) {
+    const data = await authRequest('/auth/login', { username, password, label: navigator.platform || 'Browser' });
+    set('bridge_apikey', data.api_key);
+    setSession({ username: data.user.username, role: data.user.role, account_id: data.user.account_id });
+    // Publish this PC's reply key under the account just signed in to.
+    registerClientKey().catch(() => {});
+    return data;
+  }
+
+  async function doRegister(username, password) {
+    return authRequest('/auth/register', { username, password });
+  }
+
+  /** Confirms the stored key still works and refreshes the cached role. */
+  async function refreshSession() {
+    const { server, apikey } = bridgeCreds();
+    if (!server || !apikey) return null;
+    try {
+      const data = await apiRequest(server, apikey, '/api/tools/sms-bridge/auth/me', 'GET');
+      if (data.user) {
+        setSession({ username: data.user.username, role: data.user.role, account_id: data.user.account_id });
+      }
+      return data;
+    } catch (_) {
+      return null;   // offline, or a key that has been revoked — the panel reports it in context
+    }
+  }
+
   async function generatePairingCode() {
     const { server, apikey } = bridgeCreds();
     if (!server || !apikey) throw new Error('Set the server URL and API key in ⚙️ Bridge Settings first.');
@@ -230,6 +319,38 @@
   // ── SOS Messenger bridge send ───────────────────────────────────────────────
 
   /**
+   * Finds the phone this message is for and its public key. Mirrors the server's own resolution —
+   * the chosen device, else the account default, else the only phone — so the error you get here
+   * reads the same as the one the server would have given.
+   */
+  async function resolveTargetKey(deviceId) {
+    const { devices, defaultId } = await fetchPairedDevices();
+    if (!devices.length) {
+      const err = new Error('No phone is paired with the server.');
+      err.hint = 'Use 🔗 Pair Device to link one.';
+      throw err;
+    }
+
+    const chosen = deviceId
+      ? devices.find(d => d.device_id === deviceId)
+      : (devices.find(d => d.device_id === defaultId) || (devices.length === 1 ? devices[0] : null));
+
+    if (!chosen) {
+      const err = new Error(deviceId
+        ? 'The phone selected in Bridge Settings is no longer paired.'
+        : 'Several phones are paired and none is set as default.');
+      err.hint = 'Choose which phone this PC sends through in ⚙️ Bridge Settings.';
+      throw err;
+    }
+    if (!chosen.public_key) {
+      const err = new Error(`"${chosen.label || 'That phone'}" has no encryption key.`);
+      err.hint = 'On the phone: Computer Bridge → Unlink & re-pair, using a fresh code from 🔗 Pair Device.';
+      throw err;
+    }
+    return chosen;
+  }
+
+  /**
    * Queues the message against a specific phone and then waits for that phone to confirm it went
    * out. Returns the final delivery state; throws only when the message was never accepted.
    */
@@ -242,9 +363,13 @@
     showProgress('Connecting to SOS Messenger…', 20);
     await sleep(250);
 
+    // Encrypt here, not on the server. Look up the target phone's public key and seal the message
+    // before it leaves the browser, so the server relays ciphertext it cannot read in either
+    // direction. If the phone's key can't be resolved we do NOT fall back to sending plaintext —
+    // every silent failure in this system traced back to a fallback that hid a broken state.
     const deviceId = getTargetDevice();
-    const body = { phone, message };
-    if (deviceId) body.device_id = deviceId;
+    const target   = await resolveTargetKey(deviceId);
+    const body     = { phone, device_id: target.device_id, encrypted_message: await encryptEnvelope(message, target.public_key) };
 
     const { status, data } = await bridgeCall(server, apikey, '/api/tools/sms-bridge/send', 'POST', body);
 
@@ -269,10 +394,11 @@
     }
     if (!data.ok) throw new Error(data.error || `Server error (HTTP ${status})`);
 
-    const target = (data.target && (data.target.label || data.target.device_id)) || 'the phone';
-    showProgress(`Queued for ${target} — waiting for it to send…`, 55);
+    const targetName = (data.target && (data.target.label || data.target.device_id))
+      || target.label || 'the phone';
+    showProgress(`Queued for ${targetName} — waiting for it to send…`, 55);
 
-    return await confirmDelivery(data.id, target);
+    return await confirmDelivery(data.id, targetName);
   }
 
   /**
@@ -332,6 +458,9 @@
     } else {
       addFAB(); setInterval(addFAB, 2000);
     }
+    // Confirm the stored key still works and pick up a role change (an approval, or admin granted
+    // since last time), so the admin button appears or disappears without needing a re-login.
+    refreshSession().catch(() => {});
     // Publish this PC's public key early: until a phone knows it, replies have nowhere to go and
     // sit queued on the handset.
     registerClientKey().catch(() => {});
@@ -542,7 +671,16 @@
     panel.innerHTML =
       '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid #1f2937;position:sticky;top:0;background:#111827;z-index:2">'
         + '<span style="font-weight:800;font-size:14px;color:#60a5fa">💬 Send SMS</span>'
-        + '<div style="display:flex;gap:3px"><button id="sms-inbox-btn" title="Replies" style="' + IB + '">📥</button><button id="sms-hist-btn" title="Sent history" style="' + IB + '">📜</button><button id="sms-pair-btn" title="Pair device" style="' + IB + '">🔗</button><button id="sms-cfg-btn" title="Bridge settings" style="' + IB + '">⚙️</button><button id="sms-tpl-btn" title="Edit templates" style="' + IB + '">✏️</button><button id="sms-close" style="' + IB + '">✕</button></div>'
+        // The admin button only exists for an admin. A normal user never sees that it could.
+        + '<div style="display:flex;gap:3px">'
+          + (isAdmin() ? '<button id="sms-admin-btn" title="Administration" style="' + IB + '">👤</button>' : '')
+          + '<button id="sms-inbox-btn" title="Replies" style="' + IB + '">📥</button>'
+          + '<button id="sms-hist-btn" title="Sent history" style="' + IB + '">📜</button>'
+          + '<button id="sms-pair-btn" title="Pair device" style="' + IB + '">🔗</button>'
+          + '<button id="sms-cfg-btn" title="Bridge settings" style="' + IB + '">⚙️</button>'
+          + '<button id="sms-tpl-btn" title="Edit templates" style="' + IB + '">✏️</button>'
+          + '<button id="sms-close" style="' + IB + '">✕</button>'
+        + '</div>'
       + '</div>'
       + '<div style="padding:11px 14px;border-bottom:1px solid #1f2937">'
         + '<label style="' + L + '">Ticket #</label>'
@@ -593,6 +731,8 @@
     document.getElementById('sms-pair-btn').onclick = buildPairPanel;
     document.getElementById('sms-hist-btn').onclick  = buildHistoryPanel;
     document.getElementById('sms-inbox-btn').onclick = buildInboxPanel;
+    const adminBtn = document.getElementById('sms-admin-btn');
+    if (adminBtn) adminBtn.onclick = buildAdminPanel;
 
     document.getElementById('sms-read').onclick = () => {
       const f = readFromPage();
@@ -662,22 +802,18 @@
     panel.id = 'sos-sms-panel';
     panel.style.cssText = 'position:fixed;bottom:70px;left:16px;z-index:99996;width:318px;background:#111827;border:1.5px solid #1769aa;border-radius:14px;color:#e5e7eb;font-family:system-ui,-apple-system,sans-serif;font-size:13px;box-shadow:0 10px 40px rgba(0,0,0,.6);max-height:88vh;overflow-y:auto;';
     const curServer = get('bridge_server', DEFAULT_SERVER);
-    const curKey    = get('bridge_apikey', DEFAULT_APIKEY);
     panel.innerHTML =
       '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid #1f2937;position:sticky;top:0;background:#111827;z-index:2">'
         + '<span style="font-weight:800;font-size:14px;color:#60a5fa">⚙️ Bridge Settings</span>'
         + '<button id="cfg-back" style="background:none;border:none;color:#60a5fa;font-size:12px;font-weight:700;cursor:pointer">← Back</button>'
       + '</div>'
       + '<div style="padding:14px">'
-        + '<div style="font-size:10.5px;color:#6b7280;margin-bottom:14px;line-height:1.5">Configure the SOS Messenger server URL and API key. Changes apply immediately.</div>'
+        + '<div style="font-size:10.5px;color:#6b7280;margin-bottom:14px;line-height:1.5">Point this PC at your SOS Messenger server and sign in. Changes apply immediately.</div>'
         + '<div style="margin-bottom:12px">'
           + '<label style="' + L + '">Server URL</label>'
           + '<input id="cfg-server" value="' + esc(curServer) + '" placeholder="https://..." style="' + I + ';margin-top:3px">'
         + '</div>'
-        + '<div style="margin-bottom:16px">'
-          + '<label style="' + L + '">API Key</label>'
-          + '<input id="cfg-apikey" value="' + esc(curKey) + '" type="password" placeholder="your api key" style="' + I + ';margin-top:3px">'
-        + '</div>'
+        + '<div id="cfg-auth" style="margin-bottom:16px"></div>'
         + '<div style="margin-bottom:16px">'
           + '<div style="display:flex;justify-content:space-between;align-items:center">'
             + '<label style="' + L + '">Send through</label>'
@@ -703,15 +839,13 @@
 
     document.getElementById('cfg-back').onclick = buildPanel;
     document.getElementById('cfg-dev-refresh').onclick = loadDeviceChoices;
+    renderAuthSection();
     loadDeviceChoices();
 
     document.getElementById('cfg-save').onclick = () => {
       const s = document.getElementById('cfg-server').value.trim().replace(/\/$/, '');
-      const k = document.getElementById('cfg-apikey').value.trim();
       if (!s) { cfgStatus('⚠️ Server URL is required', '#fbbf24'); return; }
-      if (!k) { cfgStatus('⚠️ API key is required', '#fbbf24'); return; }
       set('bridge_server', s);
-      set('bridge_apikey', k);
       setTargetDevice(document.getElementById('cfg-device').value);
       cfgStatus('✅ Saved!', '#34d399');
       setTimeout(buildPanel, 700);
@@ -745,8 +879,106 @@
 
     document.getElementById('cfg-reset').onclick = () => {
       document.getElementById('cfg-server').value = DEFAULT_SERVER;
-      document.getElementById('cfg-apikey').value = DEFAULT_APIKEY;
       cfgStatus('Reset — click Save to apply', '#9ca3af');
+    };
+  }
+
+  /**
+   * The sign-in half of Bridge Settings: signed-out shows log in / create account, signed-in shows
+   * who you are and a way out. An API key can still be pasted, but it lives behind Advanced — it is
+   * the fallback for a server without accounts, not the normal way in.
+   */
+  function renderAuthSection(mode) {
+    const wrap = document.getElementById('cfg-auth');
+    if (!wrap) return;
+    const session = getSession();
+    const { apikey } = bridgeCreds();
+
+    if (session && apikey) {
+      wrap.innerHTML =
+        '<label style="' + L + '">Signed in</label>'
+        + '<div style="display:flex;justify-content:space-between;align-items:center;background:#1f2937;border:1px solid #374151;border-radius:7px;padding:8px 10px;margin-top:3px">'
+          + '<div><div style="color:#d1d5db;font-weight:700;font-size:12.5px">' + esc(session.username)
+            + (session.role === 'admin' ? '<span style="font-size:9.5px;color:#60a5fa;border:1px solid #1e3a5f;border-radius:4px;padding:0 4px;margin-left:6px">admin</span>' : '')
+          + '</div>'
+          + '<div style="color:#6b7280;font-size:10.5px">account ' + esc(session.account_id) + '</div></div>'
+          + '<button id="cfg-logout" style="background:none;border:1px solid #374151;color:#9ca3af;border-radius:6px;font-size:11px;cursor:pointer;padding:4px 8px">Sign out</button>'
+        + '</div>';
+      document.getElementById('cfg-logout').onclick = () => {
+        clearSession();
+        cfgStatus('Signed out', '#9ca3af');
+        renderAuthSection();
+        loadDeviceChoices();
+      };
+      return;
+    }
+
+    if (mode === 'apikey') {
+      wrap.innerHTML =
+        '<label style="' + L + '">API key</label>'
+        + '<input id="cfg-apikey" value="' + esc(apikey) + '" type="password" placeholder="paste an API key" style="' + I + ';margin-top:3px">'
+        + '<div style="display:flex;gap:6px;margin-top:8px">'
+          + '<button id="cfg-key-save" style="flex:1;padding:8px;background:#1769aa;color:#fff;border:none;border-radius:7px;font-size:12px;font-weight:700;cursor:pointer">Use this key</button>'
+          + '<button id="cfg-key-cancel" style="padding:8px 10px;background:#1f2937;color:#9ca3af;border:1px solid #374151;border-radius:7px;font-size:12px;cursor:pointer">Back</button>'
+        + '</div>';
+      document.getElementById('cfg-key-save').onclick = () => {
+        const k = document.getElementById('cfg-apikey').value.trim();
+        if (!k) { cfgStatus('⚠️ Enter a key or sign in instead', '#fbbf24'); return; }
+        set('bridge_apikey', k);
+        setSession(null);
+        cfgStatus('✅ Key saved', '#34d399');
+        refreshSession().then(() => { renderAuthSection(); loadDeviceChoices(); });
+      };
+      document.getElementById('cfg-key-cancel').onclick = () => renderAuthSection();
+      return;
+    }
+
+    const registering = mode === 'register';
+    wrap.innerHTML =
+      '<label style="' + L + '">' + (registering ? 'Create an account' : 'Sign in') + '</label>'
+      + '<input id="cfg-user" placeholder="username" autocomplete="username" style="' + I + ';margin-top:3px">'
+      + '<input id="cfg-pass" type="password" placeholder="password" autocomplete="current-password" style="' + I + ';margin-top:6px">'
+      + (registering ? '<div style="font-size:10px;color:#6b7280;margin-top:4px;line-height:1.45">At least 10 characters. New accounts need approving by the server administrator before they can sign in.</div>' : '')
+      + '<button id="cfg-auth-go" style="width:100%;margin-top:8px;padding:9px;background:#1769aa;color:#fff;border:none;border-radius:7px;font-size:12.5px;font-weight:700;cursor:pointer">'
+        + (registering ? 'Request an account' : 'Sign in') + '</button>'
+      + '<div style="display:flex;justify-content:space-between;margin-top:7px">'
+        + '<button id="cfg-auth-swap" style="background:none;border:none;color:#60a5fa;font-size:11px;cursor:pointer;padding:0">'
+          + (registering ? '← Sign in instead' : 'Create an account →') + '</button>'
+        + '<button id="cfg-auth-key" style="background:none;border:none;color:#6b7280;font-size:11px;cursor:pointer;padding:0">Use an API key</button>'
+      + '</div>';
+
+    document.getElementById('cfg-auth-swap').onclick = () => renderAuthSection(registering ? null : 'register');
+    document.getElementById('cfg-auth-key').onclick  = () => renderAuthSection('apikey');
+
+    document.getElementById('cfg-auth-go').onclick = async () => {
+      const btn  = document.getElementById('cfg-auth-go');
+      const user = document.getElementById('cfg-user').value.trim();
+      const pass = document.getElementById('cfg-pass').value;
+      if (!user || !pass) { cfgStatus('⚠️ Enter a username and password', '#fbbf24'); return; }
+
+      // Save the URL first — signing in needs somewhere to sign in to.
+      const s = document.getElementById('cfg-server').value.trim().replace(/\/$/, '');
+      if (!s) { cfgStatus('⚠️ Enter the server URL first', '#fbbf24'); return; }
+      set('bridge_server', s);
+
+      btn.disabled = true; btn.textContent = registering ? 'Requesting…' : 'Signing in…';
+      try {
+        if (registering) {
+          const res = await doRegister(user, pass);
+          cfgStatus(res.pending ? '✅ Requested — waiting for approval' : '✅ Account created, sign in now', '#34d399');
+          renderAuthSection();
+        } else {
+          await doLogin(user, pass);
+          cfgStatus('✅ Signed in', '#34d399');
+          renderAuthSection();
+          loadDeviceChoices();
+        }
+      } catch (e) {
+        // PENDING is the expected state for a new account, not a failure — say so in those words.
+        cfgStatus((e.code === 'PENDING' ? '⏳ ' : '❌ ') + (e.message || 'Could not sign in'),
+                  e.code === 'PENDING' ? '#fbbf24' : '#fca5a5');
+        btn.disabled = false; btn.textContent = registering ? 'Request an account' : 'Sign in';
+      }
     };
   }
 
@@ -807,6 +1039,115 @@
       note.textContent = '❌ ' + (e.message || 'Could not reach the server');
       note.style.color = '#fca5a5';
     }
+  }
+
+  // ── Admin panel ─────────────────────────────────────────────────────────────
+  //
+  // Only reachable when the signed-in user is an admin — the button isn't rendered otherwise, and
+  // the server returns 404 on these routes to anyone else, so hiding the button is convenience
+  // rather than the control.
+
+  function buildAdminPanel() {
+    if (panel) panel.remove();
+    panel = document.createElement('div');
+    panel.id = 'sos-sms-panel';
+    panel.style.cssText = 'position:fixed;bottom:70px;left:16px;z-index:99996;width:318px;background:#111827;border:1.5px solid #1769aa;border-radius:14px;color:#e5e7eb;font-family:system-ui,-apple-system,sans-serif;font-size:13px;box-shadow:0 10px 40px rgba(0,0,0,.6);max-height:88vh;overflow-y:auto;';
+    panel.innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid #1f2937;position:sticky;top:0;background:#111827;z-index:2">'
+        + '<span style="font-weight:800;font-size:14px;color:#60a5fa">👤 Administration</span>'
+        + '<div style="display:flex;gap:8px;align-items:center">'
+          + '<button id="adm-refresh" style="background:none;border:none;color:#60a5fa;font-size:11px;cursor:pointer">↻</button>'
+          + '<button id="adm-back" style="background:none;border:none;color:#60a5fa;font-size:12px;font-weight:700;cursor:pointer">← Back</button>'
+        + '</div>'
+      + '</div>'
+      + '<div style="padding:11px 14px;border-bottom:1px solid #1f2937">'
+        + '<div style="font-size:10px;font-weight:800;color:#4b5563;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Waiting for approval</div>'
+        + '<div id="adm-pending" style="font-size:11.5px;color:#9ca3af">Loading…</div>'
+      + '</div>'
+      + '<div style="padding:11px 14px">'
+        + '<div style="font-size:10px;font-weight:800;color:#4b5563;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Everyone</div>'
+        + '<div id="adm-users" style="font-size:11.5px;color:#9ca3af">Loading…</div>'
+        + '<div id="adm-status" style="font-size:11.5px;min-height:16px;text-align:center;margin-top:8px"></div>'
+      + '</div>';
+    document.body.appendChild(panel);
+
+    document.getElementById('adm-back').onclick    = buildPanel;
+    document.getElementById('adm-refresh').onclick = loadAdmin;
+    loadAdmin();
+  }
+
+  function admStatus(msg, color) {
+    const el = document.getElementById('adm-status');
+    if (el) { el.textContent = msg; el.style.color = color; }
+  }
+
+  async function setUserStatus(id, status) {
+    const { server, apikey } = bridgeCreds();
+    const data = await apiRequest(server, apikey,
+      '/api/tools/sms-bridge/admin/users/' + encodeURIComponent(id) + '/status', 'POST', { status });
+    if (!data.ok) throw new Error(data.error || 'Could not update that account');
+    return data;
+  }
+
+  async function loadAdmin() {
+    const pendWrap = document.getElementById('adm-pending');
+    const allWrap  = document.getElementById('adm-users');
+    if (!pendWrap) return;
+
+    const { server, apikey } = bridgeCreds();
+    let users;
+    try {
+      const data = await apiRequest(server, apikey, '/api/tools/sms-bridge/admin/users', 'GET');
+      users = data.users || [];
+    } catch (e) {
+      pendWrap.innerHTML = '<span style="color:#fca5a5">❌ ' + esc(e.message || 'Could not load') + '</span>';
+      allWrap.textContent = '';
+      return;
+    }
+
+    const pending = users.filter(u => u.status === 'pending');
+    const me      = getSession();
+
+    pendWrap.innerHTML = pending.length ? pending.map(u =>
+      '<div style="background:#1f2937;border:1px solid #374151;border-radius:8px;padding:8px 10px;margin-bottom:7px">'
+        + '<div style="color:#d1d5db;font-weight:700">' + esc(u.username) + '</div>'
+        + '<div style="color:#6b7280;font-size:10.5px;margin-bottom:6px">requested ' + esc(u.created_at || '') + '</div>'
+        + '<div style="display:flex;gap:6px">'
+          + '<button class="adm-act" data-id="' + u.id + '" data-status="active" style="flex:1;padding:5px;background:#064e3b;color:#6ee7b7;border:1px solid #065f46;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer">✓ Approve</button>'
+          + '<button class="adm-act" data-id="' + u.id + '" data-status="denied" style="flex:1;padding:5px;background:#450a0a;color:#fca5a5;border:1px solid #7f1d1d;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer">✕ Deny</button>'
+        + '</div>'
+      + '</div>').join('')
+      : '<div style="color:#4b5563;padding:6px 0">Nothing waiting.</div>';
+
+    allWrap.innerHTML = users.map(u => {
+      const isMe  = me && u.username === me.username;
+      const tint  = { active: '#6ee7b7', pending: '#fbbf24', denied: '#9ca3af', suspended: '#fca5a5' }[u.status] || '#9ca3af';
+      // Never offer an action that would lock yourself out; the server refuses it anyway.
+      const action = isMe ? ''
+        : u.status === 'active'
+          ? '<button class="adm-act" data-id="' + u.id + '" data-status="suspended" style="background:none;border:1px solid #374151;color:#9ca3af;border-radius:6px;font-size:10.5px;cursor:pointer;padding:3px 7px">Suspend</button>'
+          : '<button class="adm-act" data-id="' + u.id + '" data-status="active" style="background:none;border:1px solid #374151;color:#6ee7b7;border-radius:6px;font-size:10.5px;cursor:pointer;padding:3px 7px">Activate</button>';
+      return '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #1f2937">'
+        + '<div style="min-width:0"><div style="color:#d1d5db;font-weight:600">' + esc(u.username)
+          + (u.role === 'admin' ? '<span style="font-size:9px;color:#60a5fa;margin-left:5px">admin</span>' : '')
+          + (isMe ? '<span style="font-size:9px;color:#6b7280;margin-left:5px">you</span>' : '')
+        + '</div>'
+        + '<div style="font-size:10.5px;color:' + tint + '">' + esc(u.status) + ' · account ' + esc(u.account_id) + '</div></div>'
+        + action
+      + '</div>';
+    }).join('');
+
+    panel.querySelectorAll('.adm-act').forEach(b => b.onclick = async () => {
+      b.disabled = true;
+      try {
+        const res = await setUserStatus(b.dataset.id, b.dataset.status);
+        admStatus('✅ ' + res.user.username + ' is now ' + res.user.status, '#34d399');
+        loadAdmin();
+      } catch (e) {
+        admStatus('❌ ' + (e.message || 'Could not update'), '#fca5a5');
+        b.disabled = false;
+      }
+    });
   }
 
   // ── Pair device panel ───────────────────────────────────────────────────────
