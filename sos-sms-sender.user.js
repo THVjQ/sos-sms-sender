@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         SOS SMS Sender
 // @namespace    https://sosphonerepairs.com.au
-// @version      18.0
-// @description  Send SMS to customers via SOS Messenger (SMS Bridge) — with Sent history
+// @version      19.0
+// @description  Send SMS to customers via SOS Messenger (SMS Bridge) — targeted delivery + Sent history
 // @author       SOS Phone Repairs
 // @match        https://app.sospos.com.au/*
 // @grant        GM_setValue
@@ -30,11 +30,20 @@
   const DEFAULT_SERVER = 'https://sosmessenger.thvjq.com.au';
   const DEFAULT_APIKEY = '';
 
+  // How long to wait for the phone to confirm the SMS actually went out. "Queued" is not the same
+  // as "sent", and silent-pending is the worst possible outcome when the message is "your phone is
+  // ready for collection".
+  const CONFIRM_TIMEOUT_MS  = 30000;
+  const CONFIRM_INTERVAL_MS = 2000;
+
   // ── Progress overlay ────────────────────────────────────────────────────────
 
   let progressEl = null;
 
-  function showProgress(step, pct, error) {
+  // `opts` (optional): { doneText, doneColor, doneIcon, sticky, hint }. The 100% state used to be
+  // hardcoded to "queued for delivery", which said nothing about whether a phone ever collected it.
+  function showProgress(step, pct, error, opts) {
+    opts = opts || {};
     if (!progressEl) {
       progressEl = document.createElement('div');
       progressEl.style.cssText = 'position:fixed;inset:0;z-index:999999;background:rgba(0,0,0,.65);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif;';
@@ -52,21 +61,28 @@
       stepEl.textContent = 'Could not send message';
       bar.style.background = 'linear-gradient(90deg,#7f1d1d,#ef4444)'; bar.style.width = '100%';
       errEl.style.display = 'block';
-      errEl.innerHTML = '<b>Error:</b> ' + esc(error) + '<br><br><span style="color:#9ca3af">Make sure the SOS Messenger server is running and the bridge is configured correctly.</span>';
+      errEl.innerHTML = '<b>Error:</b> ' + esc(error)
+        + '<br><br><span style="color:#9ca3af">' + (opts.hint ? esc(opts.hint)
+            : 'Make sure the SOS Messenger server is running and the bridge is configured correctly.') + '</span>';
       closeBtn.style.display = 'inline-block';
       return;
     }
     bar.style.width = pct + '%'; stepEl.textContent = step;
     if (pct >= 100) {
-      icon.textContent = '✅'; stepEl.style.color = '#34d399';
-      stepEl.textContent = '✅ Message queued for delivery!';
-      setTimeout(() => { progressEl && progressEl.remove(); progressEl = null; }, 1800);
+      icon.textContent   = opts.doneIcon  || '✅';
+      stepEl.style.color = opts.doneColor || '#34d399';
+      stepEl.textContent = opts.doneText  || step;
+      // A warning about an unconfirmed message must not vanish before it is read.
+      if (opts.sticky) closeBtn.style.display = 'inline-block';
+      else setTimeout(() => { progressEl && progressEl.remove(); progressEl = null; }, 1800);
     }
   }
 
   // ── Generic authenticated API call (used by send + pairing) ─────────────────
 
-  function apiRequest(server, apikey, path, method, body) {
+  // Raw call — resolves with { status, data } for any HTTP status, so callers can act on a 409
+  // ("that phone has no key") differently from a 500. Only transport failures reject.
+  function bridgeCall(server, apikey, path, method, body) {
     return new Promise((resolve, reject) => {
       try {
         GM_xmlhttpRequest({
@@ -80,11 +96,9 @@
           data:    body ? JSON.stringify(body) : undefined,
           timeout: 15000,
           onload: (res) => {
-            if (res.status === 401 || res.status === 403) {
-              reject(new Error('Authentication failed — check your API key.')); return;
-            }
-            try { resolve(JSON.parse(res.responseText)); }
-            catch (_) { reject(new Error(`Server returned invalid JSON (HTTP ${res.status})`)); }
+            let data = null;
+            try { data = JSON.parse(res.responseText); } catch (_) {}
+            resolve({ status: res.status, data });
           },
           onerror:   () => reject(new Error('Network error — is the SOS Messenger server running?')),
           ontimeout: () => reject(new Error('Request timed out — check the server URL and your internet connection.')),
@@ -93,12 +107,24 @@
     });
   }
 
+  async function apiRequest(server, apikey, path, method, body) {
+    const { status, data } = await bridgeCall(server, apikey, path, method, body);
+    if (status === 401 || status === 403) throw new Error('Authentication failed — check your API key.');
+    if (!data) throw new Error(`Server returned invalid JSON (HTTP ${status})`);
+    return data;
+  }
+
   function bridgeCreds() {
     return {
       server: get('bridge_server', DEFAULT_SERVER).replace(/\/$/, ''),
       apikey: get('bridge_apikey', DEFAULT_APIKEY),
     };
   }
+
+  // Which phone this PC sends through. Empty means "let the server pick", which is only safe while
+  // exactly one phone is paired — the picker in Bridge Settings exists so it stops being a guess.
+  const getTargetDevice = () => get('bridge_device_id', '');
+  const setTargetDevice = id => set('bridge_device_id', id || '');
 
   async function generatePairingCode() {
     const { server, apikey } = bridgeCreds();
@@ -112,57 +138,112 @@
     const { server, apikey } = bridgeCreds();
     if (!server || !apikey) throw new Error('Set the server URL and API key in ⚙️ Bridge Settings first.');
     const data = await apiRequest(server, apikey, '/api/tools/sms-bridge/devices', 'GET');
-    return data.devices || [];
+    return { devices: data.devices || [], defaultId: data.default_device_id || '' };
+  }
+
+  async function deletePairedDevice(deviceId) {
+    const { server, apikey } = bridgeCreds();
+    const data = await apiRequest(server, apikey, '/api/tools/sms-bridge/devices/' + encodeURIComponent(deviceId), 'DELETE');
+    if (!data.ok) throw new Error(data.error || 'Could not remove device');
+    if (getTargetDevice() === deviceId) setTargetDevice('');
+    return data;
   }
 
   // ── SOS Messenger bridge send ───────────────────────────────────────────────
 
+  /**
+   * Queues the message against a specific phone and then waits for that phone to confirm it went
+   * out. Returns the final delivery state; throws only when the message was never accepted.
+   */
   async function sendViaBridge(phone, message) {
-    const server = get('bridge_server', DEFAULT_SERVER).replace(/\/$/, '');
-    const apikey = get('bridge_apikey', DEFAULT_APIKEY);
+    const { server, apikey } = bridgeCreds();
     if (!server || !apikey) {
-      showProgress('', 0, 'SOS Messenger not configured. Click ⚙️ in the SMS panel to set the server URL and API key.');
-      return;
+      throw new Error('SOS Messenger not configured. Click ⚙️ in the SMS panel to set the server URL and API key.');
     }
 
-    showProgress('Connecting to SOS Messenger…', 25);
-    await sleep(300);
+    showProgress('Connecting to SOS Messenger…', 20);
+    await sleep(250);
 
-    const result = await new Promise((resolve, reject) => {
-      try {
-        GM_xmlhttpRequest({
-          method:  'POST',
-          url:     `${server}/api/tools/sms-bridge/send`,
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key':    apikey,
-            'ngrok-skip-browser-warning': '1',
-          },
-          data:    JSON.stringify({ phone, message }),
-          timeout: 15000,
-          onload:    resolve,
-          onerror:   () => reject(new Error('Network error — is the SOS Messenger server running?')),
-          ontimeout: () => reject(new Error('Request timed out — check the server URL and your internet connection.')),
-        });
-      } catch (e) { reject(e); }
-    });
+    const deviceId = getTargetDevice();
+    const body = { phone, message };
+    if (deviceId) body.device_id = deviceId;
 
-    showProgress('Processing response…', 65);
-    await sleep(200);
+    const { status, data } = await bridgeCall(server, apikey, '/api/tools/sms-bridge/send', 'POST', body);
 
-    let data;
-    try { data = JSON.parse(result.responseText); } catch (_) {
-      throw new Error(`Server returned invalid JSON (HTTP ${result.status})`);
-    }
-
-    if (result.status === 401 || result.status === 403) {
+    if (status === 401 || status === 403) {
       throw new Error('Authentication failed — check your API key in ⚙️ Settings.');
     }
-    if (!data.ok) {
-      throw new Error(data.error || `Server error (HTTP ${result.status})`);
+    if (!data) throw new Error(`Server returned invalid JSON (HTTP ${status})`);
+
+    // The server refuses to queue a message it cannot encrypt or cannot route. Each of these is
+    // fixable by the person reading it, so say what to do rather than just echoing the status.
+    if (status === 409 || status === 404) {
+      const code = data.code || '';
+      const hint =
+        code === 'NO_DEVICE_KEY'      ? 'The phone is registered but has no encryption key. On the phone: Computer Bridge → Unlink & re-pair, then generate a fresh code from 🔗 Pair Device here.' :
+        code === 'DEVICE_NOT_FOUND'   ? 'The phone selected in ⚙️ Bridge Settings is no longer paired. Pick another one, or pair the phone again.' :
+        code === 'NO_DEVICES'         ? 'No phone is paired with the server yet. Use 🔗 Pair Device to link one.' :
+        code === 'NO_DEFAULT_DEVICE'  ? 'Several phones are paired. Choose which one this PC sends through in ⚙️ Bridge Settings.' :
+                                        'Check the paired phones in ⚙️ Bridge Settings.';
+      const err = new Error(data.error || 'The server would not queue this message.');
+      err.hint = hint;
+      throw err;
+    }
+    if (!data.ok) throw new Error(data.error || `Server error (HTTP ${status})`);
+
+    const target = (data.target && (data.target.label || data.target.device_id)) || 'the phone';
+    showProgress(`Queued for ${target} — waiting for it to send…`, 55);
+
+    return await confirmDelivery(data.id, target);
+  }
+
+  /**
+   * Polls the message's own row until the phone reports it sent. "Queued" only means a row was
+   * inserted; a phone that is asleep, unpaired or out of signal leaves it sitting there, and that
+   * silence used to be reported to the user as success.
+   */
+  async function confirmDelivery(id, target) {
+    const { server, apikey } = bridgeCreds();
+    const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
+    let last = 'pending';
+
+    while (Date.now() < deadline) {
+      await sleep(CONFIRM_INTERVAL_MS);
+      let row = null;
+      try {
+        const data = await apiRequest(server, apikey, '/api/tools/sms-bridge/history?id=' + encodeURIComponent(id), 'GET');
+        row = (data.messages || [])[0];
+      } catch (_) {
+        continue;   // a blip while polling is not a delivery failure — keep waiting
+      }
+      if (!row) continue;
+      last = row.status;
+
+      if (row.status === 'sent') {
+        showProgress('', 100, null, { doneText: '✅ Delivered by ' + target });
+        return { status: 'sent', id };
+      }
+      if (row.status === 'failed') {
+        const err = new Error('The phone could not send this message.');
+        err.hint = 'Check the phone has signal and SMS permission, then try again.';
+        throw err;
+      }
+
+      const elapsed = CONFIRM_TIMEOUT_MS - (deadline - Date.now());
+      const pct = 55 + Math.min(40, Math.round((elapsed / CONFIRM_TIMEOUT_MS) * 40));
+      showProgress(row.status === 'claimed' ? `${target} is sending…` : `Waiting for ${target} to pick it up…`, pct);
     }
 
-    showProgress('Message queued!', 100);
+    // Not a failure and not a success. Say exactly that instead of picking the flattering one.
+    showProgress('', 100, null, {
+      doneIcon:  '⏳',
+      doneColor: '#fbbf24',
+      doneText:  last === 'claimed'
+        ? `${target} has the message but hasn't confirmed sending yet.`
+        : `Still queued — ${target} hasn't picked it up yet.`,
+      sticky: true,
+    });
+    return { status: last, id };
   }
 
   // ── FAB + panel ─────────────────────────────────────────────────────────────
@@ -338,12 +419,14 @@
     try {
       const h = getHistory();
       h.unshift({
-        ts:      Date.now(),
-        phone:   entry.phone   || '',
-        name:    entry.name    || '',
-        ticket:  entry.ticket  || '',
-        device:  entry.device  || '',
-        message: entry.message || '',
+        ts:       Date.now(),
+        phone:    entry.phone   || '',
+        name:     entry.name    || '',
+        ticket:   entry.ticket  || '',
+        device:   entry.device  || '',
+        message:  entry.message || '',
+        delivery: entry.delivery || 'sent',   // 'sent' | 'claimed' | 'pending'
+        msgId:    entry.msgId || null,
       });
       if (h.length > HISTORY_CAP) h.length = HISTORY_CAP;
       saveHistory(h);
@@ -475,12 +558,14 @@
       showProgress('Connecting to SOS Messenger…', 10);
       const normPhone = normalizePhone(v.phone);
       try {
-        await sendViaBridge(normPhone, message);
-        // Only reached when the send resolved (sendViaBridge throws on failure).
-        recordSent({ phone: normPhone, name: v.name, ticket: v.ticket, device: v.device, message });
+        const result = await sendViaBridge(normPhone, message);
+        // Recorded with the outcome the phone actually reported, so an unconfirmed message is not
+        // filed away in history as if it had been delivered.
+        recordSent({ phone: normPhone, name: v.name, ticket: v.ticket, device: v.device, message,
+                     delivery: result.status, msgId: result.id });
       } catch (e) {
         console.error('[SOS SMS]', e);
-        showProgress('', 0, e.message || 'Unknown error');
+        showProgress('', 0, e.message || 'Unknown error', { hint: e.hint });
       }
     };
 
@@ -511,12 +596,22 @@
           + '<label style="' + L + '">API Key</label>'
           + '<input id="cfg-apikey" value="' + esc(curKey) + '" type="password" placeholder="your api key" style="' + I + ';margin-top:3px">'
         + '</div>'
+        + '<div style="margin-bottom:16px">'
+          + '<div style="display:flex;justify-content:space-between;align-items:center">'
+            + '<label style="' + L + '">Send through</label>'
+            + '<button id="cfg-dev-refresh" style="background:none;border:none;color:#60a5fa;font-size:10.5px;font-weight:700;cursor:pointer;padding:0">↻ Reload</button>'
+          + '</div>'
+          + '<select id="cfg-device" style="' + I + ';margin-top:3px"><option value="">Loading phones…</option></select>'
+          + '<div id="cfg-device-note" style="font-size:10px;color:#6b7280;margin-top:4px;line-height:1.45"></div>'
+        + '</div>'
         + '<div style="display:flex;gap:8px;margin-bottom:12px">'
           + '<button id="cfg-save" style="flex:1;padding:10px;background:#1769aa;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer">💾 Save</button>'
           + '<button id="cfg-test" style="flex:1;padding:10px;background:#1f2937;color:#60a5fa;border:1px solid #374151;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer">🔍 Test</button>'
         + '</div>'
         + '<div id="cfg-status" style="font-size:11.5px;min-height:16px;text-align:center"></div>'
         + '<div style="margin-top:16px;padding-top:12px;border-top:1px solid #1f2937">'
+          + '<div style="font-size:10px;font-weight:800;color:#4b5563;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Note</div>'
+          + '<div style="font-size:10.5px;color:#6b7280;line-height:1.5;margin-bottom:12px">Picture messages (MMS) are not carried over the bridge. An MMS still arrives on the phone, but it will not appear here — that is a limitation, not a fault.</div>'
           + '<div style="font-size:10px;font-weight:800;color:#4b5563;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Reset to defaults</div>'
           + '<button id="cfg-reset" style="width:100%;padding:8px;background:#1f2937;color:#9ca3af;border:1px dashed #374151;border-radius:8px;font-size:12px;cursor:pointer">Reset to built-in defaults</button>'
         + '</div>'
@@ -525,6 +620,8 @@
     document.body.appendChild(panel);
 
     document.getElementById('cfg-back').onclick = buildPanel;
+    document.getElementById('cfg-dev-refresh').onclick = loadDeviceChoices;
+    loadDeviceChoices();
 
     document.getElementById('cfg-save').onclick = () => {
       const s = document.getElementById('cfg-server').value.trim().replace(/\/$/, '');
@@ -533,6 +630,7 @@
       if (!k) { cfgStatus('⚠️ API key is required', '#fbbf24'); return; }
       set('bridge_server', s);
       set('bridge_apikey', k);
+      setTargetDevice(document.getElementById('cfg-device').value);
       cfgStatus('✅ Saved!', '#34d399');
       setTimeout(buildPanel, 700);
     };
@@ -575,6 +673,60 @@
     if (el) { el.textContent = msg; el.style.color = color; }
   }
 
+  /**
+   * Fills the "Send through" picker from the server's paired devices. With one phone the choice is
+   * made automatically — the picker only earns its keep once there are two, which is exactly when
+   * guessing would start sending customers' messages from the wrong handset.
+   */
+  async function loadDeviceChoices() {
+    const sel  = document.getElementById('cfg-device');
+    const note = document.getElementById('cfg-device-note');
+    if (!sel) return;
+
+    const opt = (value, label, selected) =>
+      '<option value="' + esc(value) + '"' + (selected ? ' selected' : '') + '>' + esc(label) + '</option>';
+
+    try {
+      const { devices, defaultId } = await fetchPairedDevices();
+      const current = getTargetDevice();
+
+      if (!devices.length) {
+        sel.innerHTML = opt('', 'No phones paired');
+        note.textContent = 'Pair a phone with 🔗 Pair Device before sending.';
+        note.style.color = '#fbbf24';
+        return;
+      }
+
+      // Exactly one phone: bind to it rather than leaving the choice to the server, so adding a
+      // second phone later cannot silently redirect this PC's messages.
+      const chosen = current || (devices.length === 1 ? devices[0].device_id : defaultId);
+
+      sel.innerHTML = devices.map(d => {
+        const short = (d.device_id || '').slice(0, 8);
+        const flags = [!d.public_key && 'no key', d.device_id === defaultId && 'server default'].filter(Boolean);
+        return opt(d.device_id, (d.label || 'Phone') + ' · ' + short + (flags.length ? ' (' + flags.join(', ') + ')' : ''),
+                   d.device_id === chosen);
+      }).join('');
+
+      if (chosen && chosen !== current) setTargetDevice(chosen);
+
+      const picked = devices.find(d => d.device_id === chosen);
+      if (picked && !picked.public_key) {
+        note.textContent = 'This phone has no encryption key — re-pair it before sending.';
+        note.style.color = '#fbbf24';
+      } else {
+        note.textContent = devices.length === 1
+          ? 'One phone paired. Messages from this PC go to it.'
+          : devices.length + ' phones paired — this PC sends through the one selected above.';
+        note.style.color = '#6b7280';
+      }
+    } catch (e) {
+      sel.innerHTML = opt(getTargetDevice(), getTargetDevice() ? 'Saved phone (offline)' : 'Could not load phones');
+      note.textContent = '❌ ' + (e.message || 'Could not reach the server');
+      note.style.color = '#fca5a5';
+    }
+  }
+
   // ── Pair device panel ───────────────────────────────────────────────────────
 
   function buildPairPanel() {
@@ -595,8 +747,9 @@
         + '<div id="pair-code-wrap" style="display:none">'
           + '<div id="pair-code" style="font-family:monospace;font-size:22px;font-weight:800;text-align:center;letter-spacing:4px;color:#60a5fa;padding:10px;background:#0d1a2b;border-radius:8px;margin:12px 0">--------</div>'
           + '<p style="font-size:11px;color:#9ca3af;margin:4px 0;text-align:center">1. Open SOS Messenger on Android</p>'
-          + '<p style="font-size:11px;color:#9ca3af;margin:4px 0;text-align:center">2. Go to Settings → Unlink &amp; Re-pair</p>'
-          + '<p style="font-size:11px;color:#9ca3af;margin:4px 0;text-align:center">3. Enter the server URL and code above</p>'
+          + '<p style="font-size:11px;color:#9ca3af;margin:4px 0;text-align:center">2. Computer Bridge → Unlink &amp; re-pair</p>'
+          + '<p style="font-size:11px;color:#9ca3af;margin:4px 0;text-align:center">3. Enter the server URL, API key and the code above</p>'
+          + '<p style="font-size:10.5px;color:#fbbf24;margin:8px 0 0;text-align:center">The phone must show “Linked.” — if it reports a pairing failure, generate a new code and try again.</p>'
         + '</div>'
         + '<div id="pair-status" style="font-size:11.5px;min-height:16px;text-align:center;margin-top:8px"></div>'
         + '<div style="margin-top:16px;padding-top:12px;border-top:1px solid #1f2937">'
@@ -604,7 +757,7 @@
             + '<span style="font-size:10px;font-weight:800;color:#4b5563;text-transform:uppercase;letter-spacing:.08em">Linked devices</span>'
             + '<button id="pair-refresh" style="background:none;border:none;color:#60a5fa;font-size:11px;cursor:pointer">↻ Refresh</button>'
           + '</div>'
-          + '<div id="pair-devices" style="font-size:11.5px;color:#9ca3af">Click ↻ to load</div>'
+          + '<div id="pair-devices" style="font-size:11.5px;color:#9ca3af">Loading…</div>'
         + '</div>'
       + '</div>';
 
@@ -628,22 +781,53 @@
       }
     };
 
-    document.getElementById('pair-refresh').onclick = async () => {
+    const refreshDevices = async () => {
       const list = document.getElementById('pair-devices');
       list.textContent = 'Loading…';
       try {
-        const devices = await fetchPairedDevices();
+        const { devices, defaultId } = await fetchPairedDevices();
         if (!devices.length) { list.textContent = 'No devices linked yet'; return; }
-        list.innerHTML = devices.map(d =>
-          '<div style="padding:6px 0;border-bottom:1px solid #1f2937">'
-            + '<div style="color:#d1d5db;font-weight:600">' + esc(d.label || 'Phone') + '</div>'
-            + '<div style="color:#6b7280;font-size:10.5px">' + esc((d.device_id || '').substring(0, 8)) + '… · last seen ' + esc(d.last_seen || '—') + '</div>'
-          + '</div>'
-        ).join('');
+        list.innerHTML = devices.map(d => {
+          // A device with no public key is the stale-pairing symptom: the server can't encrypt to
+          // it, so every send to it is refused until the phone pairs again.
+          const warn = d.public_key ? '' :
+            '<div style="color:#fbbf24;font-size:10px;margin-top:2px">⚠ no encryption key — re-pair this phone</div>';
+          const tag = d.device_id === defaultId
+            ? '<span style="font-size:9.5px;color:#60a5fa;border:1px solid #1e3a5f;border-radius:4px;padding:0 4px;margin-left:5px">default</span>' : '';
+          return '<div style="padding:7px 0;border-bottom:1px solid #1f2937;display:flex;gap:8px;align-items:flex-start">'
+            + '<div style="flex:1;min-width:0">'
+              + '<div style="color:#d1d5db;font-weight:600">' + esc(d.label || 'Phone') + tag + '</div>'
+              + '<div style="color:#6b7280;font-size:10.5px">' + esc((d.device_id || '').substring(0, 8)) + '… · last seen ' + esc(d.last_seen || '—') + '</div>'
+              + warn
+            + '</div>'
+            + '<button class="pair-del" data-id="' + esc(d.device_id) + '" title="Remove this phone" '
+              + 'style="background:none;border:none;color:#6b7280;font-size:14px;cursor:pointer;padding:2px 4px;flex-shrink:0">🗑</button>'
+          + '</div>';
+        }).join('');
+
+        list.querySelectorAll('.pair-del').forEach(b => b.onclick = async () => {
+          const id = b.dataset.id;
+          if (!confirm('Remove this phone?\n\nAnything still queued for it will be marked failed.')) return;
+          b.disabled = true;
+          try {
+            const res = await deletePairedDevice(id);
+            const st = document.getElementById('pair-status');
+            st.style.color = '#34d399';
+            st.textContent = '✅ Removed' + (res.failed_messages ? ` · ${res.failed_messages} queued message(s) failed` : '');
+            refreshDevices();
+          } catch (e) {
+            const st = document.getElementById('pair-status');
+            st.style.color = '#fca5a5'; st.textContent = '❌ ' + (e.message || 'Could not remove device');
+            b.disabled = false;
+          }
+        });
       } catch (e) {
         list.textContent = '❌ ' + (e.message || 'Could not load devices');
       }
     };
+
+    document.getElementById('pair-refresh').onclick = refreshDevices;
+    refreshDevices();
   }
 
   // ── Sent history panel ──────────────────────────────────────────────────────
@@ -712,10 +896,15 @@
       const who   = esc(e.name || e.phone || 'Unknown');
       const meta  = [e.ticket && ('#' + e.ticket), e.phone, e.device].filter(Boolean).map(esc).join(' · ');
       const idx   = all.indexOf(e);   // stable index into the full list for actions
+      // Older entries predate delivery tracking; absent means "we never knew", not "confirmed".
+      const badge = !e.delivery || e.delivery === 'sent' ? ''
+        : '<span title="The phone never confirmed sending this" style="font-size:9.5px;font-weight:700;color:#fbbf24;border:1px solid #78350f;background:#451a03;border-radius:4px;padding:1px 5px;white-space:nowrap">⏳ unconfirmed</span>';
       return '<div class="hist-card" style="background:#1f2937;border:1px solid #374151;border-radius:9px;padding:9px 11px;margin-bottom:8px">'
         + '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:3px">'
           + '<span style="font-weight:700;color:#93c5fd;font-size:12.5px">' + who + '</span>'
-          + '<span title="' + esc(absTime(e.ts)) + '" style="font-size:10px;color:#6b7280;white-space:nowrap;flex-shrink:0">' + esc(relTime(e.ts)) + '</span>'
+          + '<span style="display:flex;gap:6px;align-items:baseline;flex-shrink:0">' + badge
+            + '<span title="' + esc(absTime(e.ts)) + '" style="font-size:10px;color:#6b7280;white-space:nowrap">' + esc(relTime(e.ts)) + '</span>'
+          + '</span>'
         + '</div>'
         + (meta ? '<div style="font-size:10.5px;color:#6b7280;margin-bottom:5px">' + meta + '</div>' : '')
         + '<div style="font-size:12px;color:#d1d5db;white-space:pre-wrap;line-height:1.45;background:#111827;border-radius:6px;padding:7px 9px;max-height:110px;overflow-y:auto">' + esc(e.message || '') + '</div>'
